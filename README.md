@@ -12,18 +12,6 @@ tensor-core pipeline with three numerical components:
 
 The package provides a PyTorch API and a standalone ComfyUI custom node.
 
-## Highlights
-
-- Signed INT8 Q/K/V tensor-core attention with FP32 online softmax.
-- FP32, FP16 and BF16 inputs.
-- Grouped-query attention, unequal Q/K lengths and broadcastable masks.
-- Head dimensions from 1 to 256, padded internally to D64, D128 or D256.
-- Prequantized execution for explicit memory-lifetime control.
-- GPU-resident sparse pattern construction and CUDA CSR traversal.
-- Sampling-scoped ComfyUI integration through
-  `ModelPatcher.set_model_optimized_attention()`.
-- CUDA Graph-compatible dense execution.
-
 ## Requirements
 
 | Component | Requirement |
