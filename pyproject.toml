@@ -1,0 +1,36 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4", "cmake>=3.26", "ninja"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "risa-attention"
+version = "0.1.0"
+description = "Rotation-stabilized INT8 dense and retained-mass sparse attention"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = ["torch>=2.4"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["attention", "cuda", "diffusion", "int8", "pytorch"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.scikit-build]
+cmake.source-dir = "csrc"
+cmake.build-type = "Release"
+wheel.packages = ["src/risa_attention"]
+build-dir = "build/{wheel_tag}"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"comfyui-risa-attention/*.py" = ["N999"]

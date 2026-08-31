@@ -1,0 +1,10 @@
+build/
+dist/
+*.egg-info/
+*.whl
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+bench/results/
