@@ -151,6 +151,28 @@ Sparse construction must be amortized across later calls. At 1K, dense
 attention is the practical choice. The 4K case repays construction after four
 reuses; the measured 8K and 16K cases repay it after two.
 
+### Sol-Attn comparison
+
+The latest comparison uses comfy-kitchen commit `dae00a13`, which adds its
+INT8 Sol-Attn path. Sol-Attn requires equal Q/K/V head counts, so this test uses
+BF16 `B=1,Hq=Hkv=4,D=128` rather than the GQA configuration above. Inputs use
+the same two-cluster `video_blocks` structure, and RISA uses `theta=0.99` with
+drift `0.05`.
+
+| Length | PyTorch SDPA | Sol-Attn `tau=1` | RISA dense | RISA sparse | Sol / RISA sparse |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1K | 0.0310 ms | 0.0905 ms | 0.0753 ms | 0.0778 ms | 1.16x |
+| 4K | 0.2055 ms | 0.1386 ms | 0.1361 ms | 0.1001 ms | 1.39x |
+| 8K | 0.8356 ms | 0.3045 ms | 0.3684 ms | 0.2299 ms | 1.32x |
+| 16K | 3.3364 ms | 0.7704 ms | 1.3458 ms | 0.6731 ms | 1.14x |
+
+These are steady-state medians after the RISA pattern exists. Once pattern
+construction is included, Sol-Attn is faster for 1K and 16K in the measured
+8-call schedule; RISA is faster at 4K and 8K. Three-seed NRMSE is slightly
+higher for RISA sparse at 1K and lower from 4K through 16K. The full protocol,
+p90 latency, memory, numerical ranges and 8/20-call totals are in the
+[Sol-Attn comparison](bench/SOL_ATTN_BENCHMARK.md).
+
 ## API
 
 | Entry point | Purpose |
@@ -203,6 +225,7 @@ RisaAttention/
 - [RISA Attention design article (Chinese)](docs/RISA_ATTENTION_DESIGN_ZH.md)
 - [ComfyUI integration](docs/comfyui.md)
 - [Benchmark guide](bench/README.md)
+- [RISA and Sol-Attn benchmark](bench/SOL_ATTN_BENCHMARK.md)
 - [Contributing](CONTRIBUTING.md)
 
 ## License and Attribution

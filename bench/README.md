@@ -70,6 +70,13 @@ injects repeatable block structure to exercise sparse traversal and pattern
 drift. Neither input generator substitutes for captured Q/K/V trajectories or
 end-to-end image/video quality evaluation.
 
+## Sol-Attn comparison
+
+The measured comparison with comfy-kitchen's INT8 Sol-Attn implementation is
+recorded in [SOL_ATTN_BENCHMARK.md](SOL_ATTN_BENCHMARK.md). It uses equal-head
+self-attention because Sol-Attn does not accept GQA inputs, and reports
+steady-state latency separately from RISA pattern-construction amortization.
+
 ## Reading results
 
 Use fused end-to-end median and p90 for performance decisions. A faster
