@@ -199,10 +199,86 @@ not a KV cache and does not reuse an old attention output.
 
 ### Construction paths
 
-`construct_sparse_int8_attention()` is the production constructor. Its dense
-call produces the output needed at the construction step, then a QK-only replay
-emits normalized mass for each CUDA key tile. Sorting, prefix selection and CSR
-assembly remain on the GPU.
+`construct_sparse_int8_attention()` is the production constructor. It captures
+the sufficient statistics of the online softmax while producing the dense
+output; it does not replay QK.
+
+For query $q$ and key tile $t$, let $\mu_{t,q}$ be the tile maximum and let
+$u_{t,q,\ell}$ be the local numerator accumulated by lane $\ell$ into the
+softmax denominator. Let $(m_q,d_q)$ be the final online-softmax maximum and
+denominator. The tile mass executed by the quantized kernel is
+
+$$
+M_t=\sum_q
+\frac{\sum_{\ell}u_{t,q,\ell}\,2^{\mu_{t,q}-m_q}}{d_q}.
+$$
+
+This follows directly from the online update. When a later tile raises the row
+maximum from $\mu_{t,q}$ to $m_q$, every earlier contribution is multiplied by
+$2^{\mu_{t,q}-m_q}$; division by the final $d_q$ normalizes the row. Therefore
+
+$$
+\sum_t M_t=\sum_q 1=|Q_r|
+$$
+
+for each query block $Q_r$, up to FP32 reduction error.
+
+For a complete tile, the probabilities used by the denominator are packed U8
+codes. Their subgroup sum is an exact integer no larger than
+$255\,\mathrm{CTA}_K$, so construction stores one 32-bit integer numerator and
+one FP32 tile maximum per query. The boundary tile follows the kernel's FP32
+masked denominator path and stores one FP32 numerator and one FP32 maximum.
+Two further FP32 values store the final $(m_q,d_q)$. A second CUDA kernel maps
+one CTA to each `(query block, key block)` pair and reconstructs all $M_t$ in
+parallel. The workspace is
+
+$$
+4BH_qL_q(2N_k+2)
+$$
+
+bytes for statistics, plus the FP32 mass matrix, where $N_k$ is the number of
+key tiles. At 16K tokens with four query heads this is 64.75 MiB.
+
+The previous replay implementation recomputed QK and did not preserve the
+online-softmax boundary-tile definition. With 257 keys and 64-key tiles, the
+last tile contains one valid key: replay assigned it about 8.7% of total mass,
+whereas captured denominator mass is about 0.3--0.5%. The replay value was not
+an upper bound and could change block ranking, so it could not prove the
+retained-mass condition. Capture measures the executed denominator contribution
+and is the definition used by the selector.
+
+The selector keeps PyTorch's optimized CUDA descending sort and replaces the
+remaining chain of `sum`, `cumsum`, mask, scatter, boolean indexing and a
+second reduction. One warp per mass row uses an FP64 reduction and inclusive
+scan to find the shortest prefix reaching the threshold. CUB performs an exact
+integer exclusive scan of the row counts. A parallel FP64 tree reduction forms
+the global mass summary, and a multi-CTA kernel assigns one warp to each row to
+compact selected keys in their original order. The same path is used for every
+sequence length. It does not approximate, truncate, impose fixed sparsity or
+select a fixed Top-K.
+
+Fixed-seed A/B checks produce identical row offsets and block indices to the
+Torch selector. Measured-mass differences are at most $6.9\times10^{-8}$ from
+the different FP64 reduction order and do not change an output. For the
+16-head benchmark row shapes, isolated selector median latency changes as
+follows:
+
+| rows | key blocks | PyTorch selector | CUDA selector | change |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 8 | 0.153 ms | 0.053 ms | -65.1% |
+| 512 | 32 | 0.156 ms | 0.054 ms | -65.7% |
+| 1024 | 64 | 0.163 ms | 0.056 ms | -65.6% |
+| 2048 | 128 | 0.161 ms | 0.064 ms | -60.3% |
+
+Fixed-seed checks on RTX 5090 show bitwise-identical dense output with and
+without capture at lengths 257, 1K, 4K, 8K and 16K. Per-query-block mass sums
+deviate from the number of valid queries by at most $1.53\times10^{-5}$.
+Across the complete 1K--16K, 16-head benchmark, the parallel selector reduces
+construction median by 1.7%--43.3% and p90 by 1.7%--43.3% relative to the
+previous Torch selector. Coverage, CSR indices, exact construction recall,
+drifted recall and every output-error metric remain unchanged. Full raw data
+and the A/B protocol are in
+`bench/RETAINED_MASS_SELECTOR_BENCHMARK.md`.
 
 `build_retained_mass_pattern()` is the slower reference constructor. It uses
 FP32 score and softmax calculations in 128-query chunks and exists for tests.
@@ -296,7 +372,7 @@ required.
 Results below were measured on an NVIDIA GeForce RTX 5090 D v2 (SM120),
 PyTorch 2.13.0 with CUDA 13.0, and BF16 input. Every case uses
 `B=1,Hq=16,Hkv=4,D=128`. Timed attention calls have 30 warmup iterations and
-200 samples. Construction has five samples. CUDA events measure device time;
+200 samples. Construction has 20 samples. CUDA events measure device time;
 the median and percentile columns include Q/K/V quantization for fused calls.
 
 The input seed resets to `0` before every case and pattern. This matters for
@@ -307,22 +383,22 @@ treated as ties.
 
 ### Dense normal-input comparison
 
-The bracketed interval is p20-p80 latency. NRMSE is measured against PyTorch
+The bracketed interval is p10-p90 latency. NRMSE is measured against PyTorch
 SDPA using identical tensors.
 
-| length | PyTorch SDPA | RISA dense | comfy-kitchen | SageAttention 2.2 | RISA TFLOP/s |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1K | 0.062 [0.062, 0.063] ms | 0.077 [0.074, 0.078] ms | 0.070 [0.070, 0.071] ms | 0.099 [0.097, 0.102] ms | 112.06 |
-| 4K | 0.842 [0.841, 0.842] ms | 0.353 [0.352, 0.354] ms | 0.350 [0.349, 0.350] ms | 0.351 [0.345, 0.392] ms | 389.53 |
-| 8K | 2.940 [2.937, 2.944] ms | 1.146 [1.100, 1.267] ms | 1.102 [1.099, 1.262] ms | 1.195 [1.055, 1.258] ms | 479.56 |
-| 16K | 10.826 [10.824, 10.831] ms | 4.351 [4.349, 4.354] ms | 4.352 [4.350, 4.355] ms | 4.518 [4.512, 4.524] ms | 505.39 |
+| length | PyTorch SDPA | RISA dense | comfy-kitchen |
+| ---: | ---: | ---: | ---: |
+| 1K | 0.062 [0.062, 0.062] ms | 0.075 [0.073, 0.076] ms | 0.070 [0.069, 0.071] ms |
+| 4K | 0.840 [0.838, 0.842] ms | 0.351 [0.350, 0.353] ms | 0.348 [0.347, 0.350] ms |
+| 8K | 2.922 [2.894, 2.929] ms | 1.231 [1.085, 1.267] ms | 1.210 [1.083, 1.260] ms |
+| 16K | 10.828 [10.824, 10.834] ms | 4.351 [4.348, 4.354] ms | 4.351 [4.348, 4.354] ms |
 
-| length | RISA / SDPA | RISA NRMSE | comfy-kitchen NRMSE | SageAttention NRMSE |
-| ---: | ---: | ---: | ---: | ---: |
-| 1K | 0.81x | 0.01419 | 0.01514 | 0.03825 |
-| 4K | 2.39x | 0.01528 | 0.01629 | 0.03901 |
-| 8K | 2.57x | 0.01577 | 0.01690 | 0.03989 |
-| 16K | 2.49x | 0.01563 | 0.01683 | 0.03944 |
+| length | RISA / SDPA | RISA NRMSE | comfy-kitchen NRMSE |
+| ---: | ---: | ---: | ---: |
+| 1K | 0.83x | 0.01422 | 0.01517 |
+| 4K | 2.39x | 0.01532 | 0.01637 |
+| 8K | 2.37x | 0.01580 | 0.01693 |
+| 16K | 2.49x | 0.01565 | 0.01684 |
 
 At 1K the fused quantization overhead makes every tested INT8 path slower than
 PyTorch SDPA. RISA crosses over by 4K. RISA and comfy-kitchen remain within
@@ -340,10 +416,10 @@ pattern and recompute Q/K/V.
 
 | length | construction | dense fused | sparse fused | dense / sparse | coverage | CSR index |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1K | 0.296 [0.285, 0.308] ms | 0.074 [0.073, 0.075] ms | 0.077 [0.075, 0.078] ms | 0.97x | 57.0% | 0.005 MiB |
-| 4K | 0.792 [0.769, 0.815] ms | 0.350 [0.349, 0.352] ms | 0.213 [0.212, 0.214] ms | 1.64x | 53.0% | 0.035 MiB |
-| 8K | 2.184 [2.175, 2.201] ms | 1.247 [1.079, 1.266] ms | 0.622 [0.620, 0.624] ms | 2.01x | 50.0% | 0.129 MiB |
-| 16K | 7.495 [7.476, 7.502] ms | 4.338 [4.329, 4.340] ms | 2.500 [2.492, 2.505] ms | 1.74x | 54.7% | 0.554 MiB |
+| 1K | 0.161 [0.155, 0.183] ms | 0.074 [0.073, 0.076] ms | 0.075 [0.074, 0.076] ms | 0.99x | 56.9% | 0.005 MiB |
+| 4K | 0.454 [0.448, 0.467] ms | 0.350 [0.349, 0.352] ms | 0.212 [0.211, 0.213] ms | 1.65x | 52.8% | 0.035 MiB |
+| 8K | 1.389 [1.355, 1.414] ms | 1.209 [1.082, 1.266] ms | 0.622 [0.620, 0.623] ms | 1.94x | 50.0% | 0.129 MiB |
+| 16K | 4.877 [4.872, 4.885] ms | 4.342 [4.339, 4.345] ms | 2.495 [2.489, 2.500] ms | 1.74x | 54.6% | 0.553 MiB |
 
 The pattern index is small relative to the packed attention buffers. Peak
 incremental memory for fused dense and sparse calls is effectively identical:
@@ -356,10 +432,10 @@ $C_{\rm build}+nC_s < (n+1)C_d$ gives:
 
 | length | later reuses needed | 8-call attention-only speedup | 20-call attention-only speedup |
 | ---: | ---: | ---: | ---: |
-| 1K | never | 0.71x | 0.85x |
-| 4K | 4 | 1.23x | 1.45x |
-| 8K | 2 | 1.53x | 1.78x |
-| 16K | 2 | 1.39x | 1.58x |
+| 1K | never | 0.87x | 0.94x |
+| 4K | 1 | 1.45x | 1.56x |
+| 8K | 1 | 1.68x | 1.83x |
+| 16K | 1 | 1.55x | 1.66x |
 
 The 8-call and 20-call columns assume one construction followed by seven or
 nineteen compatible sparse calls. They exclude the rest of the diffusion
@@ -383,10 +459,10 @@ error. Exact recall is measured on the drifted Q/K tensors with FP32 softmax.
 
 | length | exact recall | NRMSE vs SDPA | NRMSE vs dense | MAE | max abs | SQNR | cosine |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1K | 0.99206 | 0.02551 | 0.01757 | 0.001656 | 0.09766 | 31.87 dB | 0.999701 |
-| 4K | 0.99339 | 0.02536 | 0.01518 | 0.000867 | 0.03914 | 31.92 dB | 0.999704 |
-| 8K | 0.99558 | 0.02311 | 0.01014 | 0.000578 | 0.02661 | 32.72 dB | 0.999743 |
-| 16K | 0.99318 | 0.02610 | 0.01572 | 0.000455 | 0.02100 | 31.67 dB | 0.999684 |
+| 1K | 0.99203 | 0.02532 | 0.01760 | 0.001639 | 0.09766 | 31.93 dB | 0.999706 |
+| 4K | 0.99335 | 0.02522 | 0.01527 | 0.000860 | 0.03920 | 31.97 dB | 0.999708 |
+| 8K | 0.99558 | 0.02287 | 0.01014 | 0.000571 | 0.02637 | 32.82 dB | 0.999749 |
+| 16K | 0.99315 | 0.02573 | 0.01578 | 0.000447 | 0.02100 | 31.79 dB | 0.999694 |
 
 Construction recall and drifted current recall differ by less than 0.001
 percentage point in these synthetic cases. That verifies pattern stability for

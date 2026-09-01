@@ -728,20 +728,29 @@ def int8_attention_from_prequantized(
     if _block_mass is not None:
         if sparse_pattern is not None or quantized.attn_mask is not None:
             raise ValueError("block mass requires dense unmasked attention")
-        expected_mass_shape = (
+        mass_rows = (
             quantized.q.shape[0]
             * quantized.q.shape[1]
-            * math.ceil(quantized.q.shape[2] / 128),
-            math.ceil(quantized.k.shape[2] / quantized.cta_k),
+            * math.ceil(quantized.q.shape[2] / 128)
         )
+        mass_columns = math.ceil(quantized.k.shape[2] / quantized.cta_k)
+        query_rows = (
+            quantized.q.shape[0]
+            * quantized.q.shape[1]
+            * quantized.q.shape[2]
+        )
+        stats_elements = query_rows * (mass_columns * 2 + 2)
+        expected_workspace_elements = mass_rows * mass_columns + stats_elements
         if (
-            _block_mass.shape != expected_mass_shape
+            _block_mass.ndim != 1
+            or _block_mass.numel() != expected_workspace_elements
             or _block_mass.dtype != torch.float32
             or _block_mass.device != quantized.q.device
             or not _block_mass.is_contiguous()
         ):
             raise ValueError(
-                f"block mass must be contiguous CUDA float32 {expected_mass_shape}"
+                "block mass workspace must be contiguous CUDA float32 with "
+                f"{expected_workspace_elements} elements"
             )
     if not is_available(quantized.q.device):
         raise RuntimeError(
@@ -816,6 +825,49 @@ def int8_attention_from_prequantized(
     return output.float() if quantized.input_dtype == torch.float32 else output
 
 
+def _select_retained_mass_csr(
+    masses: torch.Tensor,
+    theta: float,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Select the shortest retained-mass prefix and pack it as ordered CSR."""
+    row_count, key_blocks = masses.shape
+    sorted_mass, descending_indices = masses.sort(dim=-1, descending=True)
+    counts = torch.empty(row_count, dtype=torch.int32, device=masses.device)
+    support = torch.empty_like(masses, dtype=torch.uint8)
+    row_totals = torch.empty(
+        row_count, 2, dtype=torch.float64, device=masses.device
+    )
+    row_offsets = torch.empty(
+        row_count + 1, dtype=torch.int32, device=masses.device
+    )
+    block_storage = torch.empty(
+        row_count * key_blocks, dtype=torch.int32, device=masses.device
+    )
+    summary = torch.empty(3, dtype=torch.float64, device=masses.device)
+    scan_workspace = torch.empty(
+        _backend._C.retained_mass_selector_workspace_size(row_count),
+        dtype=torch.uint8,
+        device=masses.device,
+    )
+    _backend._C.select_retained_mass_csr(
+        _backend.wrap_for_dlpack(sorted_mass),
+        _backend.wrap_for_dlpack(descending_indices),
+        _backend.wrap_for_dlpack(counts),
+        _backend.wrap_for_dlpack(support),
+        _backend.wrap_for_dlpack(row_totals),
+        _backend.wrap_for_dlpack(row_offsets),
+        _backend.wrap_for_dlpack(block_storage),
+        _backend.wrap_for_dlpack(summary),
+        _backend.wrap_for_dlpack(scan_workspace),
+        theta,
+        torch.cuda.current_stream(masses.device).cuda_stream,
+    )
+    selected_mass, total_mass, selected_blocks = summary.tolist()
+    block_indices = block_storage[: int(selected_blocks)]
+    measured_mass = selected_mass / max(total_mass, 1e-20)
+    return row_offsets, block_indices, measured_mass
+
+
 @torch.inference_mode()
 def construct_sparse_int8_attention_from_prequantized(
     quantized: PrequantizedInt8Attention,
@@ -825,11 +877,11 @@ def construct_sparse_int8_attention_from_prequantized(
 ) -> tuple[torch.Tensor, RetainedMassPattern]:
     """Construct reusable retained-mass support while consuming packed Q/K/V.
 
-    The CUDA attention kernel reuses its final online-softmax state and
-    recomputes QK once to emit block masses. Selection and CSR construction
-    stay on the GPU. The masses follow Sage's quantized U8 probability path;
-    use :func:`measure_pattern_recall` when exact FP attention recall is
-    required for evaluation.
+    The CUDA attention kernel captures its online-softmax sufficient statistics
+    and reconstructs block mass without replaying QK. Selection and CSR
+    construction stay on the GPU. The masses follow Sage's quantized U8
+    probability path; use :func:`measure_pattern_recall` when exact FP
+    attention recall is required for evaluation.
 
     ``theta`` is the retained-mass threshold.
     """
@@ -848,42 +900,25 @@ def construct_sparse_int8_attention_from_prequantized(
     batch, q_heads, q_length, _ = quantized.q.shape
     num_q_blocks = math.ceil(q_length / 128)
     num_k_blocks = math.ceil(quantized.k.shape[2] / quantized.cta_k)
-    masses = torch.empty(
-        batch * q_heads * num_q_blocks,
-        num_k_blocks,
+    mass_elements = batch * q_heads * num_q_blocks * num_k_blocks
+    stats_elements = batch * q_heads * q_length * (num_k_blocks * 2 + 2)
+    workspace = torch.empty(
+        mass_elements + stats_elements,
         dtype=torch.float32,
         device=quantized.q.device,
+    )
+    masses = workspace[:mass_elements].view(
+        batch * q_heads * num_q_blocks, num_k_blocks
     )
     output = int8_attention_from_prequantized(
         quantized,
         output_layout=output_layout,
-        _block_mass=masses,
+        _block_mass=workspace,
     )
 
-    sorted_mass, descending_indices = masses.sort(dim=-1, descending=True)
-    row_mass = masses.sum(dim=-1)
-    thresholds = row_mass * theta
-    counts = (sorted_mass.cumsum(dim=-1) < thresholds[:, None]).sum(dim=-1) + 1
-    counts.clamp_(max=num_k_blocks)
-    slots = torch.arange(num_k_blocks, device=masses.device)[None, :]
-    selected = (
-        torch.where(slots < counts[:, None], descending_indices, num_k_blocks)
-        .sort(dim=-1)
-        .values
+    row_offsets, block_indices, measured_mass = _select_retained_mass_csr(
+        masses, theta
     )
-    selected_mask = selected < num_k_blocks
-    block_indices = selected[selected_mask].to(torch.int32)
-    row_offsets = torch.empty(
-        masses.shape[0] + 1, dtype=torch.int32, device=masses.device
-    )
-    row_offsets[0] = 0
-    row_offsets[1:] = counts.cumsum(dim=0).to(torch.int32)
-    selected_mass = (
-        masses.gather(1, descending_indices)
-        .masked_fill(slots >= counts[:, None], 0.0)
-        .sum()
-    )
-    measured_mass = float((selected_mass / row_mass.sum().clamp_min(1e-20)).item())
 
     pattern = RetainedMassPattern(
         row_offsets=row_offsets,

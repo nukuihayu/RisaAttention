@@ -43,6 +43,7 @@ add_library(attn_cuda_kernels OBJECT
   kernels/quant_v_int8.cu
   kernels/quant_qk_int8.cu
   kernels/attention_launcher.cu
+  kernels/retained_mass_selector.cu
 )
 target_compile_options(attn_cuda_kernels PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:${ATTN_NVCC_FLAGS}>

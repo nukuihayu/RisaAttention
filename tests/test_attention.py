@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
+import math
 import weakref
 
 import pytest
@@ -33,6 +34,46 @@ def _nrmse(actual, expected):
     error = (actual.float() - expected.float()).square().mean().sqrt()
     magnitude = expected.float().square().mean().sqrt()
     return (error / magnitude).item()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(("rows", "key_blocks"), [(17, 8), (128, 32), (2048, 128)])
+@pytest.mark.parametrize("theta", [0.5, 0.9, 0.99, 1.0])
+def test_retained_mass_selector_is_exact(rows, key_blocks, theta):
+    torch.manual_seed(rows + key_blocks)
+    masses = torch.rand(rows, key_blocks, device="cuda")
+    masses[::2].mul_(8).floor_()
+
+    sorted_mass, descending_indices = masses.sort(dim=-1, descending=True)
+    row_mass = masses.sum(dim=-1)
+    counts = (
+        (sorted_mass.cumsum(dim=-1) < (row_mass * theta)[:, None]).sum(dim=-1)
+        + 1
+    ).clamp(max=key_blocks)
+    slots = torch.arange(key_blocks, device=masses.device)[None, :]
+    selected = (
+        torch.where(slots < counts[:, None], descending_indices, key_blocks)
+        .sort(dim=-1)
+        .values
+    )
+    expected_indices = selected[selected < key_blocks].to(torch.int32)
+    expected_offsets = torch.empty(rows + 1, dtype=torch.int32, device="cuda")
+    expected_offsets[0] = 0
+    expected_offsets[1:] = counts.cumsum(dim=0).to(torch.int32)
+    expected_mass = (
+        masses.gather(1, descending_indices)
+        .masked_fill(slots >= counts[:, None], 0.0)
+        .sum()
+        / row_mass.sum().clamp_min(1e-20)
+    )
+
+    offsets, indices, measured_mass = (
+        risa_attention_module._select_retained_mass_csr(masses, theta)
+    )
+
+    assert torch.equal(offsets, expected_offsets)
+    assert torch.equal(indices, expected_indices)
+    assert measured_mass == pytest.approx(float(expected_mass), abs=2e-7)
 
 
 def test_int8_attention_availability_is_bool():
@@ -656,6 +697,49 @@ def test_prequantized_frozen_support_construction_supports_sequence_major_output
     assert flattened.data_ptr() == output.data_ptr()
     assert pattern.retained_mass_target == 0.99
     assert pattern.q_length == pattern.kv_length == 257
+
+
+@requires_int8_attention
+def test_captured_block_mass_preserves_dense_output():
+    q, k, v = _qkv(1, 2, 1, 4097, 4097, 128, dtype=torch.bfloat16)
+    quantized = risa.prequantize_int8_attention(q, k, v)
+
+    expected = risa.int8_attention_from_prequantized(quantized)
+    actual, pattern = risa.construct_sparse_int8_attention_from_prequantized(
+        quantized, theta=0.99
+    )
+
+    assert torch.equal(actual, expected)
+    assert pattern.measured_retained_mass >= 0.99
+
+
+@requires_int8_attention
+def test_captured_block_mass_preserves_mass_for_partial_tail():
+    torch.manual_seed(257)
+    q, k, v = _qkv(1, 4, 2, 257, 257, 128, dtype=torch.bfloat16)
+    quantized = risa.prequantize_int8_attention(q, k, v)
+    query_blocks = math.ceil(257 / 128)
+    key_blocks = math.ceil(257 / quantized.cta_k)
+    mass_elements = 4 * query_blocks * key_blocks
+    stats_elements = 4 * 257 * (key_blocks * 2 + 2)
+    workspace = torch.empty(
+        mass_elements + stats_elements, dtype=torch.float32, device="cuda"
+    )
+
+    expected = risa.int8_attention_from_prequantized(quantized)
+    actual = risa.int8_attention_from_prequantized(
+        quantized, _block_mass=workspace
+    )
+    masses = workspace[:mass_elements].view(4, query_blocks, key_blocks)
+    expected_row_mass = torch.tensor(
+        [128.0, 128.0, 1.0], device="cuda"
+    ).expand(4, -1)
+
+    assert torch.equal(actual, expected)
+    torch.testing.assert_close(
+        masses.sum(dim=-1), expected_row_mass, rtol=0.0, atol=2e-5
+    )
+    assert masses[:, :, -1].sum() / masses.sum() < 0.01
 
 
 @requires_int8_attention

@@ -74,6 +74,103 @@ void launch_risa_attention_kernel(
     int o_st_bz, int o_st_n, int o_st_h,
     float sm_scale, int output_dtype_code, const void* sparse_row_offsets,
     const void* sparse_block_indices, void* block_mass, cudaStream_t stream);
+void launch_retained_mass_selector(
+    const float* sorted_mass, const int64_t* descending_indices,
+    int32_t* counts, uint8_t* support, double* row_totals,
+    int32_t* row_offsets, int32_t* block_indices, double* summary,
+    void* scan_workspace, size_t scan_workspace_bytes, int row_count,
+    int key_blocks, double theta, cudaStream_t stream);
+size_t retained_mass_selector_workspace_size(int row_count);
+}
+
+void select_retained_mass_csr(
+    nb::ndarray<nb::device::cuda> sorted_mass,
+    nb::ndarray<nb::device::cuda> descending_indices,
+    nb::ndarray<nb::device::cuda> counts,
+    nb::ndarray<nb::device::cuda> support,
+    nb::ndarray<nb::device::cuda> row_totals,
+    nb::ndarray<nb::device::cuda> row_offsets,
+    nb::ndarray<nb::device::cuda> block_indices,
+    nb::ndarray<nb::device::cuda> summary,
+    nb::ndarray<nb::device::cuda> scan_workspace,
+    double theta, uintptr_t stream_ptr)
+{
+    if (sorted_mass.ndim() != 2 || descending_indices.ndim() != 2) {
+        throw std::runtime_error(
+            "select_retained_mass_csr: masses and indices must be 2D");
+    }
+    const size_t rows = sorted_mass.shape(0);
+    const size_t columns = sorted_mass.shape(1);
+    const auto float_code = static_cast<uint8_t>(nb::dlpack::dtype_code::Float);
+    const auto int_code = static_cast<uint8_t>(nb::dlpack::dtype_code::Int);
+    const auto uint_code = static_cast<uint8_t>(nb::dlpack::dtype_code::UInt);
+    const bool valid =
+        rows > 0 && columns > 0 &&
+        sorted_mass.dtype().code == float_code &&
+        sorted_mass.dtype().bits == 32 && sorted_mass.stride(1) == 1 &&
+        sorted_mass.stride(0) == static_cast<int64_t>(columns) &&
+        descending_indices.shape(0) == rows &&
+        descending_indices.shape(1) == columns &&
+        descending_indices.dtype().code == int_code &&
+        descending_indices.dtype().bits == 64 &&
+        descending_indices.stride(1) == 1 &&
+        descending_indices.stride(0) == static_cast<int64_t>(columns) &&
+        counts.ndim() == 1 && counts.shape(0) == rows &&
+        counts.dtype().code == int_code && counts.dtype().bits == 32 &&
+        counts.stride(0) == 1 && support.ndim() == 2 &&
+        support.shape(0) == rows && support.shape(1) == columns &&
+        support.dtype().code == uint_code && support.dtype().bits == 8 &&
+        support.stride(1) == 1 &&
+        support.stride(0) == static_cast<int64_t>(columns) &&
+        row_totals.ndim() == 2 && row_totals.shape(0) == rows &&
+        row_totals.shape(1) == 2 && row_totals.dtype().code == float_code &&
+        row_totals.dtype().bits == 64 && row_totals.stride(1) == 1 &&
+        row_totals.stride(0) == 2 && row_offsets.ndim() == 1 &&
+        row_offsets.shape(0) == rows + 1 &&
+        row_offsets.dtype().code == int_code && row_offsets.dtype().bits == 32 &&
+        row_offsets.stride(0) == 1 && block_indices.ndim() == 1 &&
+        block_indices.shape(0) == rows * columns &&
+        block_indices.dtype().code == int_code &&
+        block_indices.dtype().bits == 32 && block_indices.stride(0) == 1 &&
+        summary.ndim() == 1 && summary.shape(0) == 3 &&
+        summary.dtype().code == float_code && summary.dtype().bits == 64 &&
+        summary.stride(0) == 1 && scan_workspace.ndim() == 1 &&
+        scan_workspace.dtype().code == uint_code &&
+        scan_workspace.dtype().bits == 8 && scan_workspace.stride(0) == 1;
+    if (!valid) {
+        throw std::runtime_error(
+            "select_retained_mass_csr: invalid shape, dtype, or stride");
+    }
+    if (rows > static_cast<size_t>(INT_MAX) ||
+        columns > static_cast<size_t>(INT_MAX) ||
+        rows > static_cast<size_t>(INT_MAX) / columns) {
+        throw std::runtime_error("select_retained_mass_csr: matrix is too large");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    const size_t required_workspace =
+        retained_mass_selector_workspace_size(static_cast<int>(rows));
+    if (scan_workspace.shape(0) < required_workspace) {
+        throw std::runtime_error(
+            "select_retained_mass_csr: scan workspace is too small");
+    }
+    launch_retained_mass_selector(
+        static_cast<const float*>(sorted_mass.data()),
+        static_cast<const int64_t*>(descending_indices.data()),
+        static_cast<int32_t*>(counts.data()),
+        static_cast<uint8_t*>(support.data()),
+        static_cast<double*>(row_totals.data()),
+        static_cast<int32_t*>(row_offsets.data()),
+        static_cast<int32_t*>(block_indices.data()),
+        static_cast<double*>(summary.data()), scan_workspace.data(),
+        scan_workspace.shape(0), static_cast<int>(rows),
+        static_cast<int>(columns), theta, stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("retained-mass selector launch failed: ") +
+            cudaGetErrorString(err));
+    }
 }
 
 // Nanobind wrapper: signed INT8 V quantization
@@ -370,15 +467,18 @@ void risa_sdpa_prequantized(
         auto &mass = block_mass.value();
         const int num_q_blocks = (Lq + 127) / 128;
         const int num_k_blocks = (Lk + cta_k - 1) / cta_k;
+        const size_t mass_elements =
+            static_cast<size_t>(B) * H_q * num_q_blocks * num_k_blocks;
+        const size_t stats_elements = static_cast<size_t>(B) * H_q * Lq *
+                                      (num_k_blocks * 2 + 2);
         const auto float_code = static_cast<uint8_t>(nb::dlpack::dtype_code::Float);
-        if (mass.ndim() != 2 ||
-            mass.shape(0) != static_cast<size_t>(B) * H_q * num_q_blocks ||
-            mass.shape(1) != static_cast<size_t>(num_k_blocks) ||
+        if (mass.ndim() != 1 ||
+            mass.shape(0) != mass_elements + stats_elements ||
             mass.dtype().code != float_code || mass.dtype().bits != 32 ||
-            mass.stride(1) != 1 || mass.stride(0) != num_k_blocks) {
+            mass.stride(0) != 1) {
             throw std::runtime_error(
-                "risa_sdpa_prequantized: block_mass must be contiguous float32 "
-                "[B*Hq*ceil(Lq/128), ceil(Lk/cta_k)]");
+                "risa_sdpa_prequantized: block_mass workspace must contain "
+                "mass rows followed by captured tile statistics and softmax state");
         }
         block_mass_ptr = mass.data();
     }
@@ -656,6 +756,14 @@ NB_MODULE(_C, m) {
           nb::arg("sparse_row_offsets") = nb::none(),
           nb::arg("sparse_block_indices") = nb::none(),
           nb::arg("block_mass") = nb::none());
+    m.def("select_retained_mass_csr", &select_retained_mass_csr,
+          nb::arg("sorted_mass"), nb::arg("descending_indices"),
+          nb::arg("counts"), nb::arg("support"), nb::arg("row_totals"),
+          nb::arg("row_offsets"), nb::arg("block_indices"),
+          nb::arg("summary"), nb::arg("scan_workspace"), nb::arg("theta"),
+          nb::arg("stream_ptr"));
+    m.def("retained_mass_selector_workspace_size",
+          &retained_mass_selector_workspace_size, nb::arg("row_count"));
     m.def("risa_sdpa", &risa_sdpa,
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("o"),
           nb::arg("q_int8"), nb::arg("q_scale"), nb::arg("k_int8"),

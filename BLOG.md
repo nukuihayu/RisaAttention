@@ -4,7 +4,7 @@
 
 RISA（Rotation-stabilized INT8 Sparse Attention）是一套用于扩散模型推理的 CUDA attention 实现。计算骨架来自 SageAttention/comfy-kitchen 的 INT8 tensor-core 路径，修改针对两类误差来源和一类性能瓶颈：Q/K 的通道离群值、V 的非零中心量化残差，以及长序列中低概率质量 attention block 的重复计算。对应的方法是共享正交 Q/K 旋转与 key translation、residual-zero midpoint-affine V 量化，以及按概率质量构造并复用的 block-sparse support。
 
-本文从 attention 不变量和量化误差出发推导这些设计，随后讨论 CUDA 数据布局、稀疏模式生命周期和构造成本。RTX 5090 实验表明，dense RISA 在 4K-16K token 上相对 PyTorch SDPA 达到 2.39x-2.57x；V 量化相对 comfy-kitchen 持续降低 NRMSE。对具有块结构的输入，`theta=0.99` 的 sparse 路径在 4K-16K 上相对 dense RISA 达到 1.64x-2.01x steady-state 加速。所有稀疏结果均单独计入 pattern 构造成本和 drift 后的 FP32 exact recall。
+本文从 attention 不变量和量化误差出发推导这些设计，随后讨论 CUDA 数据布局、稀疏模式生命周期和构造成本。RTX 5090 最新实验表明，dense RISA 在 4K-16K token 上相对 PyTorch SDPA 达到 2.37x-2.49x；V 量化相对 comfy-kitchen 持续降低 NRMSE。对具有块结构的输入，`theta=0.99` 的 sparse 路径在 4K-16K 上相对 dense RISA 达到 1.65x-1.94x steady-state 加速。并行 CUDA selector 相对原 Torch selector 将完整构造 median 降低 1.7%-43.3%，且 CSR support 与输出指标不变。
 
 ## 1. 问题背景与设计目标
 
@@ -39,7 +39,7 @@ RISA 将研究问题限定为三项：
 | K 动态范围偏移 | softmax 对行常数平移不变 | representative-key translation | 每个 batch/KV-head 一个索引 |
 | V 非零中心 | midpoint 最小化通道最大半径 | fused V quantizer | min/max reduction |
 | V 残差均值 | 固定 code/scale 下的最小二乘中心 | V quantizer 与 attention epilogue | 小规模残差 reduction 和一次 FMA |
-| 长序列冗余 tile | 最小 tile 数的 retained-mass 前缀 | QK mass replay、GPU sort、CSR kernel | 一次构造与 CSR traversal |
+| 长序列冗余 tile | 最小 tile 数的 retained-mass 前缀 | 在线 softmax 统计捕获、GPU sort、并行 CSR selector | 一次构造与 CSR traversal |
 
 ## 2. 计算路径与数值边界
 
@@ -335,15 +335,25 @@ y_i=m_i y_i^{S}+(1-m_i)y_i^{T},
 
 ### 5.3 GPU pattern 构造
 
-生产接口 `construct_sparse_int8_attention()` 在一次调用内完成两项工作。首先执行 dense INT8 attention，返回构造时刻本来就需要的模型输出；随后进行一次 QK-only replay，为每个 CUDA key tile 输出归一化 probability mass。tile 排序、最短前缀选择和 CSR 组装全部留在 GPU 上。
-
-构造步骤不重复 PV，但必须重新遍历 QK。设量化、dense QK、PV 和 tile selection 的成本分别为 $C_{\mathrm{quant}}$、$C_{QK}$、$C_{PV}$ 和 $C_{\mathrm{select}}$，可写成
+生产接口 `construct_sparse_int8_attention()` 在 dense INT8 attention 计算输出的同时，捕获在线 softmax 已实际用于更新分母的充分统计量，不再 replay QK。对 query $q$ 和 key tile $t$，设 $u_{t,q,\ell}$ 是 lane $\ell$ 的局部分子，$\mu_{t,q}$ 是 tile maximum，$(m_q,d_q)$ 是最终在线 softmax 状态，则执行路径对应的 tile mass 为
 
 ```math
-C_{\mathrm{build}}\approx C_{\mathrm{quant}}+2C_{QK}+C_{PV}+C_{\mathrm{select}}.
+M_t=\sum_q
+\frac{\sum_\ell u_{t,q,\ell}2^{\mu_{t,q}-m_q}}{d_q}.
 ```
 
-这解释了构造延迟高于单次 dense 调用的原因。将 mass 复制到 CPU 后排序会增加同步和传输，生产路径没有采用这种实现。
+完整 tile 的 U8 分子先归约为每个 query 一个精确整数；边界 tile 保存 FP32 分子。单独的 CUDA kernel 使用最终 $(m_q,d_q)$ 并行重建 block mass。这样定义直接满足每个 query block 的质量守恒，而旧 replay 在 257-token 边界案例中会把仅含一个有效 key 的尾块从实际约 0.3%-0.5% 错估为约 8.7%，从而改变 block 排名。
+
+重建后仍使用 PyTorch 的 CUDA sort。最短前缀由每行一个 warp 判定，CUB 对行计数执行精确整数 exclusive scan，并行 FP64 归约生成质量摘要，多 CTA compaction 按原 key 顺序写入 CSR。所有序列长度使用同一路径，没有固定 Top-K、固定 density 或按长度分叉。生产路径仅为读取精确 `nnz` 和 measured mass 保留一次 GPU 到 CPU 同步。
+
+若 dense 调用成本为 $C_d$，统计捕获与重建、排序、选择和 CSR 压缩分别记为 $C_{\mathrm{capture}}$、$C_{\mathrm{reconstruct}}$、$C_{\mathrm{sort}}$、$C_{\mathrm{select}}$ 和 $C_{\mathrm{CSR}}$，则
+
+```math
+C_{\mathrm{build}}\approx C_d+C_{\mathrm{capture}}+C_{\mathrm{reconstruct}}
++C_{\mathrm{sort}}+C_{\mathrm{select}}+C_{\mathrm{CSR}}.
+```
+
+构造仍高于单次 dense 调用，但不再支付第二次 QK。16-head selector 微基准在 1K-16K 对应形状上比 Torch selector 快 60.3%-65.7%；完整构造 median 改善 1.7%-43.3%，p90 同样全部改善。
 
 项目另提供 `build_retained_mass_pattern()` 作为数值参考，按 128-query chunk 使用 FP32 score 和 softmax 测试 support selection，不进入运行时热路径。生产构造器依据量化后的 Sage probability mass 选 tile；`measure_pattern_recall()` 再以 FP32 softmax 独立测量构造时刻或 drift 后的 exact recall。构造依据与评估依据由此分离。
 
@@ -432,34 +442,34 @@ python bench/benchmark_sparse.py \
   --case 1,16,4,4096,4096,128 \
   --case 1,16,4,8192,8192,128 \
   --case 1,16,4,16384,16384,128 \
-  --pattern video_blocks --theta 0.99 --drift 0.05 \
+  --pattern video_blocks --pattern normal --theta 0.99 --drift 0.05 \
   --seed 0 --warmup 30 --iterations 200 \
-  --construction-iterations 5
+  --construction-iterations 20 --compare-comfy-kitchen
 ```
 
 本节报告 attention 张量上的 kernel-level 性能与数值误差。端到端生成质量在第 10 节单独界定。
 
-### 8.2 Dense RISA 对比 SDPA、comfy-kitchen 和 SageAttention
+### 8.2 Dense RISA 对比 SDPA 和 comfy-kitchen
 
-| 长度 | PyTorch SDPA | RISA dense | comfy-kitchen | SageAttention 2.2 | RISA / SDPA |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1K | 0.062 [0.062, 0.063] ms | 0.077 [0.074, 0.078] ms | 0.070 [0.070, 0.071] ms | 0.099 [0.097, 0.102] ms | 0.81x |
-| 4K | 0.842 [0.841, 0.842] ms | 0.353 [0.352, 0.354] ms | 0.350 [0.349, 0.350] ms | 0.351 [0.345, 0.392] ms | 2.39x |
-| 8K | 2.940 [2.937, 2.944] ms | 1.146 [1.100, 1.267] ms | 1.102 [1.099, 1.262] ms | 1.195 [1.055, 1.258] ms | 2.57x |
-| 16K | 10.826 [10.824, 10.831] ms | 4.351 [4.349, 4.354] ms | 4.352 [4.350, 4.355] ms | 4.518 [4.512, 4.524] ms | 2.49x |
+| 长度 | PyTorch SDPA | RISA dense | comfy-kitchen | RISA / SDPA |
+| ---: | ---: | ---: | ---: | ---: |
+| 1K | 0.062 [0.062, 0.062] ms | 0.075 [0.073, 0.076] ms | 0.070 [0.069, 0.071] ms | 0.83x |
+| 4K | 0.840 [0.838, 0.842] ms | 0.351 [0.350, 0.353] ms | 0.348 [0.347, 0.350] ms | 2.39x |
+| 8K | 2.922 [2.894, 2.929] ms | 1.231 [1.085, 1.267] ms | 1.210 [1.083, 1.260] ms | 2.37x |
+| 16K | 10.828 [10.824, 10.834] ms | 4.351 [4.348, 4.354] ms | 4.351 [4.348, 4.354] ms | 2.49x |
 
-方括号为 p20-p80。speedup 使用 median 计算。
+方括号为 p10-p90。speedup 使用 median 计算。
 
-1K case 中，RISA 的 0.077 ms 高于 SDPA 的 0.062 ms，量化与 launch 开销尚未被矩阵乘法节省抵消。交叉点出现在 1K 与 4K 之间；4K-16K 的 RISA/SDPA speedup 为 2.39x-2.57x。RISA 与 comfy-kitchen 在 4K、16K 的差异约为 1%，8K 的分位区间存在重叠，因此 dense kernel 的性能按持平处理。
+1K case 中，RISA 的 0.075 ms 高于 SDPA 的 0.062 ms，量化与 launch 开销尚未被矩阵乘法节省抵消。交叉点出现在 1K 与 4K 之间；4K-16K 的 RISA/SDPA speedup 为 2.37x-2.49x。RISA 与 comfy-kitchen 在 4K、16K 的差异约为 1%，8K 的分位区间存在重叠，因此 dense kernel 的性能按持平处理。
 
-| 长度 | RISA NRMSE | comfy-kitchen NRMSE | SageAttention NRMSE |
-| ---: | ---: | ---: | ---: |
-| 1K | 0.01419 | 0.01514 | 0.03825 |
-| 4K | 0.01528 | 0.01629 | 0.03901 |
-| 8K | 0.01577 | 0.01690 | 0.03989 |
-| 16K | 0.01563 | 0.01683 | 0.03944 |
+| 长度 | RISA NRMSE | comfy-kitchen NRMSE |
+| ---: | ---: | ---: |
+| 1K | 0.01422 | 0.01517 |
+| 4K | 0.01532 | 0.01637 |
+| 8K | 0.01580 | 0.01693 |
+| 16K | 0.01565 | 0.01684 |
 
-residual-zero midpoint V 在四个长度上都降低了对 SDPA 的 NRMSE。相对 comfy-kitchen，降幅分别为 6.27%、6.20%、6.69% 和 7.13%。独立三 seed 实验测得零中心 normal V 的输出 RMSE 降低 5.98%-6.96%，带通道偏置的 V 降幅更高。该差异来自 V quantizer 与 epilogue center restoration；执行路径没有增加独立输出 pass。
+residual-zero midpoint V 在四个长度上都降低了对 SDPA 的 NRMSE。相对 comfy-kitchen，最新完整基准中的降幅分别为 6.32%、6.39%、6.72% 和 7.02%。独立三 seed 实验测得零中心 normal V 的输出 RMSE 降低 5.98%-6.96%，带通道偏置的 V 降幅更高。该差异来自 V quantizer 与 epilogue center restoration；执行路径没有增加独立输出 pass。
 
 ### 8.3 `theta=0.99` 的 retained-mass sparse 结果
 
@@ -467,14 +477,14 @@ residual-zero midpoint V 在四个长度上都降低了对 SDPA 的 NRMSE。相�
 
 | 长度 | 构造 | dense fused | sparse fused | dense / sparse | coverage | CSR 索引 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1K | 0.296 [0.285, 0.308] ms | 0.074 [0.073, 0.075] ms | 0.077 [0.075, 0.078] ms | 0.97x | 57.0% | 0.005 MiB |
-| 4K | 0.792 [0.769, 0.815] ms | 0.350 [0.349, 0.352] ms | 0.213 [0.212, 0.214] ms | 1.64x | 53.0% | 0.035 MiB |
-| 8K | 2.184 [2.175, 2.201] ms | 1.247 [1.079, 1.266] ms | 0.622 [0.620, 0.624] ms | 2.01x | 50.0% | 0.129 MiB |
-| 16K | 7.495 [7.476, 7.502] ms | 4.338 [4.329, 4.340] ms | 2.500 [2.492, 2.505] ms | 1.74x | 54.7% | 0.554 MiB |
+| 1K | 0.161 [0.155, 0.183] ms | 0.074 [0.073, 0.076] ms | 0.075 [0.074, 0.076] ms | 0.99x | 56.9% | 0.005 MiB |
+| 4K | 0.454 [0.448, 0.467] ms | 0.350 [0.349, 0.352] ms | 0.212 [0.211, 0.213] ms | 1.65x | 52.8% | 0.035 MiB |
+| 8K | 1.389 [1.355, 1.414] ms | 1.209 [1.082, 1.266] ms | 0.622 [0.620, 0.623] ms | 1.94x | 50.0% | 0.129 MiB |
+| 16K | 4.877 [4.872, 4.885] ms | 4.342 [4.339, 4.345] ms | 2.495 [2.489, 2.500] ms | 1.74x | 54.6% | 0.553 MiB |
 
 方括号为 p10-p90。构造列包含该步 dense 输出和 pattern 生成。
 
-4K-16K 的 steady-state dense/sparse 比值为 1.64x、2.01x 和 1.74x。1K 的比值为 0.97x，此时 CSR traversal 抵消了减少 tile 带来的收益。
+4K-16K 的 steady-state dense/sparse 比值为 1.65x、1.94x 和 1.74x。1K 的比值为 0.99x，此时 CSR traversal 抵消了减少 tile 带来的收益。
 
 稀疏路径仍为当前步骤生成量化 Q/K/V buffer，显存下降仅来自未物化完整 attention matrix 的共同在线 softmax 设计，而非 coverage。dense 和 sparse fused 调用的峰值增量显存基本一致：1K、4K、8K、16K 分别约为 7.0、28.1、56.1、112.3 MiB。CSR 索引分别为 0.005、0.035、0.129 和 0.554 MiB。
 
@@ -496,12 +506,12 @@ residual-zero midpoint V 在四个长度上都降低了对 SDPA 的 NRMSE。相�
 
 | 长度 | drift 后 FP32 exact recall | NRMSE vs SDPA | NRMSE vs dense INT8 | SQNR | cosine |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1K | 0.99206 | 0.02551 | 0.01757 | 31.87 dB | 0.999701 |
-| 4K | 0.99339 | 0.02536 | 0.01518 | 31.92 dB | 0.999704 |
-| 8K | 0.99558 | 0.02311 | 0.01014 | 32.72 dB | 0.999743 |
-| 16K | 0.99318 | 0.02610 | 0.01572 | 31.67 dB | 0.999684 |
+| 1K | 0.99203 | 0.02532 | 0.01760 | 31.93 dB | 0.999706 |
+| 4K | 0.99335 | 0.02522 | 0.01527 | 31.97 dB | 0.999708 |
+| 8K | 0.99558 | 0.02287 | 0.01014 | 32.82 dB | 0.999749 |
+| 16K | 0.99315 | 0.02573 | 0.01578 | 31.79 dB | 0.999694 |
 
-在 `video_blocks`、drift 0.05 条件下，四个长度的 FP32 exact recall 为 0.99206-0.99558。相对 dense INT8 的附加 NRMSE 为 0.01014-0.01757，对应 coverage 为 50.0%-57.0%。这些数值描述的是受控结构化输入上的 support 稳定性。
+在 `video_blocks`、drift 0.05 条件下，四个长度的 FP32 exact recall 为 0.99203-0.99558。相对 dense INT8 的附加 NRMSE 为 0.01014-0.01760，对应 coverage 为 50.0%-56.9%。这些数值描述的是受控结构化输入上的 support 稳定性。
 
 随机正态输入作为负对照。在 `theta=0.99` 下，其 probability mass 分散到接近全部 block，coverage 接近 100%，sparse 路径因而没有可削减的主体计算。retained-mass 稀疏度由输入结构产生，而非由固定 density 强制指定。
 
@@ -511,10 +521,10 @@ residual-zero midpoint V 在四个长度上都降低了对 SDPA 的 NRMSE。相�
 
 | 长度 | 回本所需后续复用 | 8 次 attention 总体加速上限 | 20 次 attention 总体加速上限 |
 | ---: | ---: | ---: | ---: |
-| 1K | 无法回本 | 0.71x | 0.85x |
-| 4K | 4 次 | 1.23x | 1.45x |
-| 8K | 2 次 | 1.53x | 1.78x |
-| 16K | 2 次 | 1.39x | 1.58x |
+| 1K | 无法回本 | 0.87x | 0.94x |
+| 4K | 1 次 | 1.45x | 1.56x |
+| 8K | 1 次 | 1.68x | 1.83x |
+| 16K | 1 次 | 1.55x | 1.66x |
 
 表中只统计 attention，未计入 diffusion model 的其他层，因此数值构成端到端生成加速的上限。shape、CFG 分支、scale 或 mask 变化会产生独立 pattern；每次 pattern 重建均重新计入 $C_{\mathrm{build}}$。
 
@@ -529,14 +539,14 @@ residual-zero midpoint V 在四个长度上都降低了对 SDPA 的 NRMSE。相�
 | V scale/center metadata 交错存储 | 4K 和 16K 更慢 |
 | 整除长度专用 last-tile loop | 没有稳定收益 |
 
-1K sparse 的 0.97x dense/sparse 比值也作为负结果保留，用于确定当前 kernel 与调度开销下的短序列区间。
+1K sparse 的 0.99x dense/sparse 比值也作为负结果保留，用于确定当前 kernel 与调度开销下的短序列区间。
 
 ## 10. 结论的适用范围与后续实验
 
 当前 kernel benchmark 支持以下结论：
 
 - midpoint-affine residual-zero V 可以在保持 dense 性能的同时降低 INT8 输出误差；
-- retained-mass support 在具有块结构的 4K-16K 序列上可以减少约一半 tile，并获得 1.64x-2.01x steady-state 加速；
+- retained-mass support 在具有块结构的 4K-16K 序列上可以减少约一半 tile，并获得 1.65x-1.94x steady-state 加速；
 - 构造成本、短序列和近 dense support 会消除 sparse 路径的收益。
 
 实验尚未覆盖：
@@ -557,7 +567,7 @@ NRMSE 表的对象是 attention 输出 tensor，其数值范围随层和 timeste
 
 RISA 在同一条 attention 数据路径上组合了三项互相约束的设计。共享正交旋转和 key translation 在保持浮点 score/probability 等价的条件下改善 Q/K 量化分布；midpoint-affine V 最小化通道最大量化半径，residual-zero center 则给出固定 code/scale 下的最小二乘中心；retained-mass selection 以 probability mass 定义质量预算，并只在后续步骤复用 block support。
 
-RTX 5090 实验中，dense RISA 在 4K-16K 上相对 SDPA 达到 2.39x-2.57x，性能与 comfy-kitchen 基线持平，同时 NRMSE 降低 6.20%-7.13%。结构化 `theta=0.99` sparse 在 4K-16K 上进一步获得 1.64x-2.01x steady-state dense-relative 加速，drift 后 FP32 exact recall 为 0.99206-0.99558。1K sparse 为 0.97x，随机正态输入接近 dense coverage；这两个对照给出了当前实现的性能适用域。真实生成质量需要按第 10 节的轨迹与端到端协议继续测量。
+RTX 5090 实验中，dense RISA 在 4K-16K 上相对 SDPA 达到 2.37x-2.49x，性能与 comfy-kitchen 基线持平，同时 NRMSE 降低 6.32%-7.02%。结构化 `theta=0.99` sparse 在 4K-16K 上进一步获得 1.65x-1.94x steady-state dense-relative 加速，drift 后 FP32 exact recall 为 0.99203-0.99558。1K sparse 为 0.99x，随机正态输入接近 dense coverage；这两个对照给出了当前实现的性能适用域。并行 CUDA selector 相对 Torch selector 保持相同 CSR support，并使完整构造在全部 8 个 length-pattern 组合上同时改善 median 与 p90。真实生成质量需要按第 10 节的轨迹与端到端协议继续测量。
 
 ## 参考资料
 

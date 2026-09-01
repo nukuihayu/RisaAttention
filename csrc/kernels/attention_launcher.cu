@@ -16,7 +16,7 @@ namespace {
 
 template <int HEAD_DIM, int CTA_K, MaskMode mask_mode, typename DTypeOut,
           bool use_sparse_support = false,
-          bool return_block_mass = false>
+          bool capture_block_mass = false>
 void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
                  float *k_scale, float *v_scale, float *v_center,
                  const void *mask,
@@ -48,7 +48,7 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
       CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8,
       QuantGranularity::kPerThread, QuantGranularity::kPerThread, float, false,
       DTypeOut, ComputeUnit::kCudaCore, mask_mode, false, true, false,
-      use_sparse_support, return_block_mass>;
+      use_sparse_support, capture_block_mass>;
 
   cudaError_t error = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -61,7 +61,6 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
 
   dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
   dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
-
   kernel<<<grid, block, smem_max, stream>>>(
       q, k, v, o, nullptr, q_scale, k_scale, v_scale, v_center, mask,
       mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
@@ -70,6 +69,13 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
       stride_bz_v, stride_h_v, stride_d_v, stride_bz_o, stride_seq_o,
       stride_h_o, sm_scale, sparse_row_offsets, sparse_block_indices,
       block_mass);
+
+  if constexpr (capture_block_mass) {
+    const uint32_t num_mass_blocks = div_ceil(kv_len, CTA_K);
+    dim3 mass_grid(grid.x * num_mass_blocks, num_qo_heads, batch_size);
+    captured_block_mass_kernel<CTA_Q><<<mass_grid, CTA_Q, 0, stream>>>(
+        block_mass, qo_len, num_mass_blocks, grid.x, num_qo_heads);
+  }
 
   error = cudaGetLastError();
   if (error != cudaSuccess) {
@@ -153,7 +159,7 @@ extern "C" void launch_risa_attention_kernel(
       static_cast<const int32_t *>(sparse_block_indices), nullptr, stream)
 
 #define LAUNCH_MASS(HD, CK, DT)                                               \
-  launch_impl<HD, CK, MaskMode::kNone, DT, false, true>(                      \
+  launch_impl<HD, CK, MaskMode::kNone, DT, false, true>(                       \
       q_, k_, v_, static_cast<DT *>(o), qs_, ks_, vs_, vc_, nullptr, 0, 0, 0, 0, \
       -1, qo_len, kv_len, num_qo_heads, num_kv_groups, stride_bz_q,           \
       stride_seq_q, stride_h_q, stride_bz_k, stride_seq_k, stride_h_k,        \

@@ -74,5 +74,4 @@ ComfyUI workloads. No length threshold or user-facing hyperparameter was
 added. A short-length fallback would recover latency but discard measured
 quality gains, so it is not part of this change.
 
-The command in `bench/README.md` reproduces the matrix and writes raw JSON to
-the requested `--json` path.
+The command in `bench/README.md` reproduces the benchmark matrix.

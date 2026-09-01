@@ -48,6 +48,94 @@
 #define MMA_SV_N 16
 #define MMA_SV_K 32
 
+template <uint32_t CTA_Q, uint32_t WARP_Q, uint32_t num_tiles_q,
+          uint32_t num_tiles_k>
+__device__ __forceinline__ void store_full_block_mass_max(
+    int32_t scores[][num_tiles_k][8], const float sm_scale,
+    float *workspace,
+    const uint32_t block_index, const uint32_t num_blocks,
+    const uint32_t batch_id, const uint32_t head_id,
+    const uint32_t num_qo_heads, const uint32_t qo_len, const uint32_t bx,
+    const uint32_t lane_id) {
+  const uint32_t mass_elements =
+      gridDim.z * num_qo_heads * gridDim.x * num_blocks;
+  uint32_t *stats = reinterpret_cast<uint32_t *>(workspace + mass_elements);
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+    for (uint32_t row_half = 0; row_half < 2; row_half++) {
+      int32_t local_max = INT_MIN;
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+        local_max = max(
+            local_max,
+            max(max(scores[fq][fk][row_half * 2],
+                    scores[fq][fk][row_half * 2 + 1]),
+                max(scores[fq][fk][row_half * 2 + 4],
+                    scores[fq][fk][row_half * 2 + 5])));
+      }
+      float tile_max = fmaf(__int2float_rz(local_max), sm_scale,
+                            -S_U8_OFFSET);
+      tile_max = max(
+          tile_max, __shfl_xor_sync(0xffffffff, tile_max, 0x1));
+      tile_max = max(
+          tile_max, __shfl_xor_sync(0xffffffff, tile_max, 0x2));
+      const uint32_t query_idx =
+          bx * CTA_Q + get_warp_id() * WARP_Q + fq * 16 + lane_id / 4 +
+          row_half * 8;
+      if ((lane_id & 3) == 0 && query_idx < qo_len) {
+        const uint32_t row =
+            (batch_id * num_qo_heads + head_id) * qo_len + query_idx;
+        const uint32_t offset =
+            (row * (num_blocks - 1) + block_index) * 2;
+        stats[offset + 1] = __float_as_uint(tile_max);
+      }
+    }
+  }
+}
+
+template <uint32_t CTA_Q, uint32_t WARP_Q, uint32_t num_tiles_q,
+          uint32_t num_tiles_k>
+__device__ __forceinline__ void store_full_block_mass_numerator(
+    uint32_t probabilities[][num_tiles_k / 2][4], float *workspace,
+    const uint32_t block_index, const uint32_t num_blocks,
+    const uint32_t batch_id, const uint32_t head_id,
+    const uint32_t num_qo_heads, const uint32_t qo_len, const uint32_t bx,
+    const uint32_t lane_id) {
+  const uint32_t mass_elements =
+      gridDim.z * num_qo_heads * gridDim.x * num_blocks;
+  uint32_t *stats = reinterpret_cast<uint32_t *>(workspace + mass_elements);
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+    for (uint32_t row_half = 0; row_half < 2; row_half++) {
+      uint32_t lane_numerator = 0;
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
+        lane_numerator = __dp4a(
+            probabilities[fq][fk][row_half], 0x01010101u, lane_numerator);
+        lane_numerator = __dp4a(
+            probabilities[fq][fk][row_half + 2], 0x01010101u,
+            lane_numerator);
+      }
+      lane_numerator +=
+          __shfl_xor_sync(0xffffffff, lane_numerator, 0x1);
+      lane_numerator +=
+          __shfl_xor_sync(0xffffffff, lane_numerator, 0x2);
+      const uint32_t query_idx =
+          bx * CTA_Q + get_warp_id() * WARP_Q + fq * 16 + lane_id / 4 +
+          row_half * 8;
+      if ((lane_id & 3) == 0 && query_idx < qo_len) {
+        const uint32_t row =
+            (batch_id * num_qo_heads + head_id) * qo_len + query_idx;
+        const uint32_t offset =
+            (row * (num_blocks - 1) + block_index) * 2;
+        stats[offset] = lane_numerator;
+      }
+    }
+  }
+}
+
 template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN,
           QuantGranularity K_GRAN, typename DTypeSVAccum = float,
@@ -56,7 +144,7 @@ template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           MaskMode mask_mode = MaskMode::kNone, bool return_lse = false,
           bool fuse_v_scale = false, bool use_pv_fp16_accu = false,
           bool use_sparse_support = false,
-          bool return_block_mass = false>
+          bool capture_block_mass = false>
 __global__ void qk_int_sv_i8_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -99,7 +187,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
   static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
   static_assert(!use_sparse_support || mask_mode == MaskMode::kNone,
                 "sparse support cannot be combined with an attention mask");
-  static_assert(!return_block_mass ||
+  static_assert(!capture_block_mass ||
                     (!use_sparse_support && mask_mode == MaskMode::kNone),
                 "block mass is only supported by dense unmasked attention");
 
@@ -422,8 +510,20 @@ __global__ void qk_int_sv_i8_attn_kernel(
     }
     uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
     if constexpr (mask_mode == MaskMode::kNone) {
-      update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
-          RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
+      if constexpr (capture_block_mass) {
+        store_full_block_mass_max<CTA_Q, WARP_Q, num_tiles_q, num_tiles_k>(
+            RS, sm_scale, block_mass, iter - 1, num_iterations,
+            batch_id, head_id, num_qo_heads, qo_len, bx, lane_id);
+        update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
+            RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
+        store_full_block_mass_numerator<CTA_Q, WARP_Q, num_tiles_q,
+                                        num_tiles_k>(
+            RS_u8, block_mass, iter - 1, num_iterations, batch_id, head_id,
+            num_qo_heads, qo_len, bx, lane_id);
+      } else {
+        update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
+            RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
+      }
     } else {
       float pv_scale[num_tiles_q][2];
       float RS_soft[num_tiles_q][num_tiles_k][8];
@@ -537,8 +637,21 @@ __global__ void qk_int_sv_i8_attn_kernel(
 
     uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
     if constexpr (mask_mode == MaskMode::kNone) {
-      update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
-          RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
+      if constexpr (capture_block_mass) {
+        store_full_block_mass_max<CTA_Q, WARP_Q, num_tiles_q, num_tiles_k>(
+            RS, sm_scale, block_mass, num_iterations - 2,
+            num_iterations, batch_id, head_id, num_qo_heads, qo_len, bx,
+            lane_id);
+        update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
+            RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
+        store_full_block_mass_numerator<CTA_Q, WARP_Q, num_tiles_q,
+                                        num_tiles_k>(
+            RS_u8, block_mass, num_iterations - 2, num_iterations, batch_id,
+            head_id, num_qo_heads, qo_len, bx, lane_id);
+      } else {
+        update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
+            RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
+      }
     } else {
       float pv_scale[num_tiles_q][2];
       float RS_soft[num_tiles_q][num_tiles_k][8];
@@ -689,6 +802,48 @@ __global__ void qk_int_sv_i8_attn_kernel(
         K_idx_lane_base, RS_soft, kv_len,
         pre_scale_scores ? -50000.0f : -1.0e30f);
 
+    if constexpr (capture_block_mass) {
+      const uint32_t mass_elements =
+          gridDim.z * num_qo_heads * gridDim.x * num_iterations;
+      uint32_t *stats =
+          reinterpret_cast<uint32_t *>(block_mass + mass_elements);
+      const uint32_t full_stats_words =
+          gridDim.z * num_qo_heads * qo_len * (num_iterations - 1) * 2;
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+        for (uint32_t row_half = 0; row_half < 2; row_half++) {
+          float local_max = -50000.0f;
+#pragma unroll
+          for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+            local_max = max(
+                local_max,
+                max(max(RS_soft[fq][fk][row_half * 2],
+                        RS_soft[fq][fk][row_half * 2 + 1]),
+                    max(RS_soft[fq][fk][row_half * 2 + 4],
+                        RS_soft[fq][fk][row_half * 2 + 5])));
+          }
+          local_max = fmaf(local_max, sm_scale, -S_U8_OFFSET);
+          local_max = max(
+              local_max,
+              __shfl_xor_sync(0xffffffff, local_max, 0x1));
+          local_max = max(
+              local_max,
+              __shfl_xor_sync(0xffffffff, local_max, 0x2));
+          const uint32_t query_idx =
+              bx * CTA_Q +
+              get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + fq * 16 +
+              lane_id / 4 + row_half * 8;
+          if ((lane_id & 3) == 0 && query_idx < qo_len) {
+            const uint32_t row =
+                (batch_id * num_qo_heads + head_id) * qo_len + query_idx;
+            stats[full_stats_words + row * 2 + 1] =
+                __float_as_uint(local_max);
+          }
+        }
+      }
+    }
+
     update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
                pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,
                                  S_U8_OFFSET);
@@ -698,6 +853,41 @@ __global__ void qk_int_sv_i8_attn_kernel(
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore) {
       accumulate_d<num_tiles_q, num_tiles_k>(RS_soft, d, pv_scale);
+    }
+    if constexpr (capture_block_mass) {
+      const uint32_t mass_elements =
+          gridDim.z * num_qo_heads * gridDim.x * num_iterations;
+      uint32_t *stats =
+          reinterpret_cast<uint32_t *>(block_mass + mass_elements);
+      const uint32_t full_stats_words =
+          gridDim.z * num_qo_heads * qo_len * (num_iterations - 1) * 2;
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+        for (uint32_t row_half = 0; row_half < 2; row_half++) {
+          float numerator = 0.0f;
+#pragma unroll
+          for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+            numerator += RS_soft[fq][fk][row_half * 2];
+            numerator += RS_soft[fq][fk][row_half * 2 + 1];
+            numerator += RS_soft[fq][fk][row_half * 2 + 4];
+            numerator += RS_soft[fq][fk][row_half * 2 + 5];
+          }
+          numerator +=
+              __shfl_xor_sync(0xffffffff, numerator, 0x1);
+          numerator +=
+              __shfl_xor_sync(0xffffffff, numerator, 0x2);
+          const uint32_t query_idx =
+              bx * CTA_Q +
+              get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + fq * 16 +
+              lane_id / 4 + row_half * 8;
+          if ((lane_id & 3) == 0 && query_idx < qo_len) {
+            const uint32_t row =
+                (batch_id * num_qo_heads + head_id) * qo_len + query_idx;
+            stats[full_stats_words + row * 2] = __float_as_uint(numerator);
+          }
+        }
+      }
     }
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
@@ -721,147 +911,38 @@ __global__ void qk_int_sv_i8_attn_kernel(
   // TODO: thread block sync mdo state for num_warps_k > 0. Then only one thread
   // block needs to do the final saving.
 
-  if constexpr (return_block_mass) {
-    // Recompute QK after online softmax has produced the final row max and
-    // denominator. This emits one normalized mass per CTA_Q x CTA_K tile
-    // without storing token-level probabilities in global memory.
+  if constexpr (capture_block_mass) {
     const uint32_t num_mass_blocks = div_ceil(kv_len, CTA_K);
-    const uint32_t mass_row =
-        (batch_id * num_qo_heads + head_id) * gridDim.x + bx;
-    float cta_mass_total = 0.0f;
-    float *mass_smem = reinterpret_cast<float *>(smem);
-    for (uint32_t mass_block = 0; mass_block < num_mass_blocks; mass_block++) {
-      K_lane_base_ptr =
-          K_sparse_lane_base_ptr + mass_block * CTA_K * stride_seq_k;
-      K_load_idx_lane_base =
-          mass_block * CTA_K + K_load_idx_lane_offset;
-      load_global_to_share<global_to_shared_line_lanes_QK,
-                           global_to_shared_copy_lines_per_warp_QK,
-                           QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK,
-                           QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
-          &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K,
-          K_load_idx_lane_base, kv_len);
-      cp_async::commit_group();
-      cp_async::wait_group<0>();
-      __syncthreads();
-
-      if constexpr (num_tiles_qk_inner == 1) {
-        compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                       num_tiles_qk_inner, swizzle_mode_QK,
-                       QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
-            smem_K, RS, RQ, K_smem_offset_mma);
-      } else {
-        compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                       num_tiles_qk_inner, swizzle_mode_QK,
-                       QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
-            smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
-      }
-
-      const float mass_sm_scale =
-          original_sm_scale * q_scale *
-          K_scale[k_scale_idx + mass_block * k_scale_advance_offset];
-      float warp_mass = 0.0f;
+    const uint32_t mass_elements =
+        gridDim.z * num_qo_heads * gridDim.x * num_mass_blocks;
+    uint32_t *stats =
+        reinterpret_cast<uint32_t *>(block_mass + mass_elements);
+    const uint32_t full_stats_words =
+        gridDim.z * num_qo_heads * qo_len * (num_mass_blocks - 1) * 2;
+    const uint32_t query_rows = gridDim.z * num_qo_heads * qo_len;
+    float *softmax_state =
+        reinterpret_cast<float *>(stats + full_stats_words + query_rows * 2);
 #pragma unroll
-      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
-        for (uint32_t row_half = 0; row_half < 2; row_half++) {
-          int32_t row_scores[num_tiles_k][4];
-          int32_t local_max = INT_MIN;
-#pragma unroll
-          for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-            constexpr int32_t invalid_score = -1000000000;
-            const uint32_t elements[4] = {row_half * 2,
-                                          row_half * 2 + 1,
-                                          row_half * 2 + 4,
-                                          row_half * 2 + 5};
-#pragma unroll
-            for (uint32_t value = 0; value < 4; value++) {
-              const uint32_t element = elements[value];
-              const uint32_t kv_idx =
-                  mass_block * CTA_K + K_idx_lane_offset + fk * 16 +
-                  8 * (element / 4) + element % 2;
-              const int32_t score =
-                  kv_idx < kv_len ? RS[fq][fk][element] : invalid_score;
-              row_scores[fk][value] = score;
-              local_max = max(local_max, score);
-            }
-          }
-          float tile_m =
-              fmaf(__int2float_rz(local_max), mass_sm_scale, -S_U8_OFFSET);
-          tile_m = max(tile_m,
-                       __shfl_xor_sync(0xffffffff, tile_m, 0x1));
-          tile_m = max(tile_m,
-                       __shfl_xor_sync(0xffffffff, tile_m, 0x2));
-
-          float numerator = 0.0f;
-#pragma unroll
-          for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-            if (mass_block + 1 == num_mass_blocks) {
-              numerator += math::ptx_exp2(fmaf(
-                  __int2float_rz(row_scores[fk][0]), mass_sm_scale, -tile_m));
-              numerator += math::ptx_exp2(fmaf(
-                  __int2float_rz(row_scores[fk][1]), mass_sm_scale, -tile_m));
-              numerator += math::ptx_exp2(fmaf(
-                  __int2float_rz(row_scores[fk][2]), mass_sm_scale, -tile_m));
-              numerator += math::ptx_exp2(fmaf(
-                  __int2float_rz(row_scores[fk][3]), mass_sm_scale, -tile_m));
-            } else {
-              numerator += pack_scaled_exp2_u8x4(
-                               row_scores[fk][0], row_scores[fk][1],
-                               row_scores[fk][2], row_scores[fk][3],
-                               mass_sm_scale, -tile_m)
-                               .denominator;
-            }
-          }
-          numerator *= math::ptx_exp2(tile_m - m[fq][row_half]);
-          numerator +=
-              __shfl_xor_sync(0xffffffff, numerator, 0x1);
-          numerator +=
-              __shfl_xor_sync(0xffffffff, numerator, 0x2);
-
-          float denominator = d[fq][row_half];
-          denominator +=
-              __shfl_xor_sync(0xffffffff, denominator, 0x1);
-          denominator +=
-              __shfl_xor_sync(0xffffffff, denominator, 0x2);
-          const uint32_t query_idx =
-              bx * CTA_Q +
-              get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q +
-              fq * 16 + lane_id / 4 + row_half * 8;
-          if ((lane_id & 3) == 0 && query_idx < qo_len) {
-            warp_mass += numerator / denominator;
-          }
+      for (uint32_t row_half = 0; row_half < 2; row_half++) {
+        const uint32_t query_idx =
+            bx * CTA_Q +
+            get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + fq * 16 +
+            lane_id / 4 + row_half * 8;
+        float denominator = d[fq][row_half];
+        denominator +=
+            __shfl_xor_sync(0xffffffff, denominator, 0x1);
+        denominator +=
+            __shfl_xor_sync(0xffffffff, denominator, 0x2);
+        if ((lane_id & 3) == 0 && query_idx < qo_len) {
+          const uint32_t row =
+              (batch_id * num_qo_heads + head_id) * qo_len + query_idx;
+          softmax_state[row * 2] = m[fq][row_half];
+          softmax_state[row * 2 + 1] = denominator;
         }
       }
-#pragma unroll
-      for (uint32_t offset = 16; offset > 0; offset >>= 1) {
-        warp_mass +=
-            __shfl_down_sync(0xffffffff, warp_mass, offset);
-      }
-      if (lane_id == 0) {
-        mass_smem[warp_id] = warp_mass;
-      }
-      __syncthreads();
-      if (warp_id == 0 && lane_id == 0) {
-        float cta_mass = 0.0f;
-#pragma unroll
-        for (uint32_t warp = 0; warp < num_warps; warp++) {
-          cta_mass += mass_smem[warp];
-        }
-        block_mass[mass_row * num_mass_blocks + mass_block] = cta_mass;
-        cta_mass_total += cta_mass;
-      }
-      __syncthreads();
     }
-    if (warp_id == 0 && lane_id == 0) {
-      const float valid_rows = min(CTA_Q, qo_len - bx * CTA_Q);
-      const float normalization = valid_rows / cta_mass_total;
-      for (uint32_t mass_block = 0; mass_block < num_mass_blocks;
-           mass_block++) {
-        block_mass[mass_row * num_mass_blocks + mass_block] *= normalization;
-      }
-    }
-    __syncthreads();
   }
 
   normalize_d<num_tiles_q, num_tiles_v, ComputeUnit::kCudaCore>(RO, m, d);
@@ -1015,6 +1096,70 @@ __global__ void qk_int_sv_i8_attn_kernel(
 
     if (lse_idx < qo_len) {
       lse_lane_ptr[0] = math::ptx_log2(d[fq][k]) + m[fq][k];
+    }
+  }
+}
+
+template <uint32_t CTA_Q>
+__global__ void captured_block_mass_kernel(
+    float *__restrict__ workspace, const uint32_t qo_len,
+    const uint32_t num_mass_blocks, const uint32_t num_q_blocks,
+    const uint32_t num_qo_heads) {
+  __shared__ float warp_sums[CTA_Q / 32];
+
+  const uint32_t mass_block = blockIdx.x % num_mass_blocks;
+  const uint32_t q_block = blockIdx.x / num_mass_blocks;
+  const uint32_t query_idx = q_block * CTA_Q + threadIdx.x;
+  const uint32_t query_rows = gridDim.z * num_qo_heads * qo_len;
+  const uint32_t mass_elements =
+      gridDim.z * num_qo_heads * num_q_blocks * num_mass_blocks;
+  const uint32_t full_stats_words =
+      query_rows * (num_mass_blocks - 1) * 2;
+  const uint32_t *stats =
+      reinterpret_cast<const uint32_t *>(workspace + mass_elements);
+  const float *softmax_state = reinterpret_cast<const float *>(
+      stats + full_stats_words + query_rows * 2);
+
+  float query_mass = 0.0f;
+  if (query_idx < qo_len) {
+    const uint32_t row =
+        (blockIdx.z * num_qo_heads + blockIdx.y) * qo_len + query_idx;
+    float numerator;
+    float tile_max;
+    if (mass_block + 1 < num_mass_blocks) {
+      const uint32_t offset =
+          (row * (num_mass_blocks - 1) + mass_block) * 2;
+      numerator = __uint2float_rn(stats[offset]);
+      tile_max = __uint_as_float(stats[offset + 1]);
+    } else {
+      const uint32_t offset = full_stats_words + row * 2;
+      numerator = __uint_as_float(stats[offset]);
+      tile_max = __uint_as_float(stats[offset + 1]);
+    }
+    query_mass = numerator *
+                 math::ptx_exp2(tile_max - softmax_state[row * 2]) /
+                 softmax_state[row * 2 + 1];
+  }
+
+#pragma unroll
+  for (uint32_t offset = 16; offset > 0; offset >>= 1) {
+    query_mass += __shfl_down_sync(0xffffffff, query_mass, offset);
+  }
+  if ((threadIdx.x & 31) == 0) {
+    warp_sums[threadIdx.x >> 5] = query_mass;
+  }
+  __syncthreads();
+
+  if (threadIdx.x < 32) {
+    float block_mass = threadIdx.x < CTA_Q / 32 ? warp_sums[threadIdx.x] : 0.0f;
+#pragma unroll
+    for (uint32_t offset = 16; offset > 0; offset >>= 1) {
+      block_mass += __shfl_down_sync(0xffffffff, block_mass, offset);
+    }
+    if (threadIdx.x == 0) {
+      const uint32_t mass_row =
+          (blockIdx.z * num_qo_heads + blockIdx.y) * num_q_blocks + q_block;
+      workspace[mass_row * num_mass_blocks + mass_block] = block_mass;
     }
   }
 }

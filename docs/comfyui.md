@@ -89,6 +89,14 @@ repeat package imports. Dense mode carries no sampling state. Sparse mode adds
 one Python dictionary lookup per attention call, while CSR tensors and pattern
 selection remain on the GPU.
 
+Pattern construction captures the dense kernel's online-softmax statistics and
+does not replay QK. Sorting stays in PyTorch's CUDA implementation; shortest
+prefix selection, count scan, measured-mass reduction and ordered CSR packing
+run on the unified parallel CUDA path. On the published RTX 5090 benchmark this
+reduces complete construction median by 1.7%-43.3% versus the former PyTorch
+selector without changing selected support. See the
+[selector benchmark](../bench/RETAINED_MASS_SELECTOR_BENCHMARK.md).
+
 Models that bypass ComfyUI's optimized-attention hook are outside this node's
 scope. Compatibility is tested against the `ModelPatcher` API in
 `/workspace/ComfyUI`; future ComfyUI API changes may require an adapter update.

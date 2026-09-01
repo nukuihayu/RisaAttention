@@ -126,10 +126,10 @@ end-to-end latency and NRMSE against PyTorch SDPA; each case uses 30 warmups and
 
 | Length | PyTorch SDPA | RISA dense INT8 | comfy-kitchen INT8 | RISA / SDPA |
 | ---: | ---: | ---: | ---: | ---: |
-| 1K | 0.062 ms | 0.077 ms / 0.01419 | 0.070 ms / 0.01514 | 0.81x |
-| 4K | 0.842 ms | 0.353 ms / 0.01528 | 0.350 ms / 0.01629 | 2.39x |
-| 8K | 2.940 ms | 1.146 ms / 0.01577 | 1.102 ms / 0.01690 | 2.57x |
-| 16K | 10.826 ms | 4.351 ms / 0.01563 | 4.352 ms / 0.01683 | 2.49x |
+| 1K | 0.062 ms | 0.075 ms / 0.01422 | 0.070 ms / 0.01517 | 0.83x |
+| 4K | 0.840 ms | 0.351 ms / 0.01532 | 0.348 ms / 0.01637 | 2.39x |
+| 8K | 2.922 ms | 1.231 ms / 0.01580 | 1.210 ms / 0.01693 | 2.37x |
+| 16K | 10.828 ms | 4.351 ms / 0.01565 | 4.351 ms / 0.01684 | 2.49x |
 
 Residual-zero midpoint V removes the long-sequence regression of the original
 midpoint implementation. Against comfy-kitchen's absmax V, output RMSE is
@@ -142,14 +142,20 @@ drift `0.05`. Construction cost is reported separately.
 
 | Length | Construction | Dense INT8 | Sparse INT8 | Coverage | Dense / sparse |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1K | 0.296 ms | 0.074 ms | 0.077 ms | 57.0% | 0.97x |
-| 4K | 0.792 ms | 0.350 ms | 0.213 ms | 53.0% | 1.64x |
-| 8K | 2.184 ms | 1.247 ms | 0.622 ms | 50.0% | 2.01x |
-| 16K | 7.495 ms | 4.338 ms | 2.500 ms | 54.7% | 1.74x |
+| 1K | 0.161 ms | 0.074 ms | 0.075 ms | 56.9% | 0.99x |
+| 4K | 0.454 ms | 0.350 ms | 0.212 ms | 52.8% | 1.65x |
+| 8K | 1.389 ms | 1.209 ms | 0.622 ms | 50.0% | 1.94x |
+| 16K | 4.877 ms | 4.342 ms | 2.495 ms | 54.6% | 1.74x |
 
 Sparse construction must be amortized across later calls. At 1K, dense
-attention is the practical choice. The 4K case repays construction after four
-reuses; the measured 8K and 16K cases repay it after two.
+attention is the practical choice. At 4K, 8K, and 16K, one compatible sparse
+reuse after construction is sufficient to repay the construction overhead in
+this attention-only benchmark.
+
+The parallel CUDA selector lowers complete construction median by 1.7%-43.3%
+and p90 by 1.7%-43.3% versus the previous PyTorch selector without changing
+CSR support or output metrics. See the
+[retained-mass selector benchmark](bench/RETAINED_MASS_SELECTOR_BENCHMARK.md).
 
 ### Sol-Attn comparison
 
@@ -196,7 +202,7 @@ Run the CUDA and adapter tests:
 python -m pytest -q -p no:cacheprovider
 ```
 
-Benchmark commands, metrics and JSON output options are documented in
+Benchmark commands and metrics are documented in
 [bench/README.md](bench/README.md).
 
 ```bash
@@ -214,7 +220,7 @@ RisaAttention/
 |-- comfyui-risa-attention/      ComfyUI node
 |-- bench/                       Reproducible benchmarks
 |-- tests/                       CUDA and adapter tests
-|-- docs/RISA_ATTENTION_DESIGN_ZH.md  Chinese design article
+|-- BLOG.md                      Chinese design article
 |-- docs/design.md               Algorithms and implementation notes
 `-- docs/comfyui.md              ComfyUI lifecycle and compatibility
 ```
@@ -222,9 +228,10 @@ RisaAttention/
 ## Documentation
 
 - [Design and numerical methods](docs/design.md)
-- [RISA Attention design article (Chinese)](docs/RISA_ATTENTION_DESIGN_ZH.md)
+- [RISA Attention design article (Chinese)](BLOG.md)
 - [ComfyUI integration](docs/comfyui.md)
 - [Benchmark guide](bench/README.md)
+- [Retained-mass selector benchmark](bench/RETAINED_MASS_SELECTOR_BENCHMARK.md)
 - [RISA and Sol-Attn benchmark](bench/SOL_ATTN_BENCHMARK.md)
 - [Contributing](CONTRIBUTING.md)
 
