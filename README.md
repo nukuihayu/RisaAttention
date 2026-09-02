@@ -1,16 +1,17 @@
 # RISA Attention
 
-CUDA-native INT8 attention for diffusion inference, with dense and
-retained-mass sparse execution.
+RISA (Rotation-stabilized INT8 Sparse Attention) is a CUDA extension for
+diffusion inference. It provides a dense INT8 scaled-dot-product attention
+path and an optional retained-mass block-sparse path for self-attention.
 
-RISA (Rotation-stabilized INT8 Sparse Attention) combines a SageAttention-style
-tensor-core pipeline with three numerical components:
+The dense kernel uses a shared Q/K orthogonal transform, a softmax-invariant
+key translation, and residual-zero midpoint-affine INT8 V quantization. The
+sparse path builds a block support while producing a dense result, then applies
+that frozen support to later calls with current Q, K and V tensors. It is not a
+KV cache and does not reuse an earlier attention output.
 
-- shared orthogonal Q/K rotation and softmax-invariant key translation;
-- residual-zero midpoint-affine INT8 quantization for V;
-- reusable block-sparse support selected by retained attention mass.
-
-The package provides a PyTorch API and a standalone ComfyUI custom node.
+The package includes a PyTorch API, CUDA sources, reproducible benchmarks, and
+a standalone ComfyUI custom node.
 
 ## Requirements
 
@@ -21,22 +22,20 @@ The package provides a PyTorch API and a standalone ComfyUI custom node.
 | PyTorch | CUDA build, 2.4 or newer |
 | CUDA Toolkit | 13.0 or newer |
 | GPU | NVIDIA SM75 or newer |
-| Build system | CMake 3.26 or newer and Ninja |
+| Build tools | CMake 3.26 or newer and Ninja |
 
-RISA builds native cubins for the selected architecture. Build the package on
-the target machine, or set `CMAKE_CUDA_ARCHITECTURES` explicitly when creating
-a wheel.
+Source builds produce native cubins for the selected CUDA architecture. Build
+on the target GPU, or set `CMAKE_CUDA_ARCHITECTURES` while building a wheel.
 
 ## Installation
 
-From a source checkout:
+Install from a source checkout:
 
 ```bash
 python -m pip install .
 ```
 
-CMake uses the visible GPU as the native target by default. To build explicitly
-for an RTX 5090:
+For an RTX 5090 build with cubins only:
 
 ```bash
 CUDACXX=/usr/local/cuda/bin/nvcc \
@@ -44,7 +43,7 @@ CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=120-real" \
 python -m pip install .
 ```
 
-Verify the installed extension:
+Verify that the extension is available:
 
 ```bash
 python -c "import risa_attention as risa; print(risa.int8_attention_is_available())"
@@ -52,7 +51,9 @@ python -c "import risa_attention as risa; print(risa.int8_attention_is_available
 
 ## Quick Start
 
-Q, K and V use `[batch, heads, sequence, head_dim]` layout.
+RISA uses `[batch, heads, sequence, head_dim]` (HND) tensors. Dense attention
+accepts grouped-query attention: the number of query heads must be divisible by
+the number of KV heads.
 
 ```python
 import torch
@@ -65,15 +66,15 @@ v = torch.randn_like(k)
 output = risa.int8_attention(q, k, v)
 ```
 
-Separate quantization from attention when the caller needs explicit control
-over temporary tensor lifetimes:
+Prequantization separates packing from execution when the caller controls
+temporary tensor lifetimes:
 
 ```python
 packed = risa.prequantize_int8_attention(q, k, v)
 output = risa.int8_attention_from_prequantized(packed)
 ```
 
-Construct retained-mass sparse support during a dense call, then reuse it:
+To construct and reuse retained-mass support:
 
 ```python
 dense_output, pattern = risa.construct_sparse_int8_attention(
@@ -81,18 +82,30 @@ dense_output, pattern = risa.construct_sparse_int8_attention(
 )
 later_output = risa.sparse_int8_attention(q, k, v, pattern)
 
-print(pattern.coverage)
-print(pattern.measured_retained_mass)
-print(pattern.index_bytes)
+print(pattern.coverage, pattern.measured_retained_mass, pattern.index_bytes)
 ```
 
-A sparse pattern is tied to its tensor shape, head layout, device and attention
-scale. Applications decide how long the pattern remains valid.
+The first call is dense construction. Reuse only a pattern from a compatible
+shape, head layout, device, dtype and attention scale; refresh it when the
+attention structure has changed.
+
+## Capability and Limits
+
+| Path | Q/K/V dtype | Attention form | Constraints |
+| --- | --- | --- | --- |
+| Dense INT8 | FP16, BF16, FP32 | Self- or cross-attention; GQA/MQA; unequal Q/K lengths | HND layout; head dimension 1-256 |
+| Dense INT8 with mask | FP16, BF16, FP32 | Same as dense | Mask must broadcast to `[B, Hq, Lq, Lkv]` |
+| Retained-mass sparse | FP16, BF16, FP32 | Unmasked self-attention; GQA/MQA | `Lq == Lkv`; support must be constructed before reuse |
+
+Sparse support is an approximation controlled by `theta`. Higher values retain
+more attention mass and typically reduce sparsity; `0.99` is the ComfyUI node
+default. Short sequences or near-uniform attention may not amortize the
+construction cost. Evaluate with model trajectories before using sparse mode in
+a production image or video workflow.
 
 ## ComfyUI
 
-Build the package with ComfyUI's Python interpreter, then install the bundled
-node directory:
+Install RISA with ComfyUI's Python interpreter, then link the bundled node:
 
 ```bash
 cd /path/to/RisaAttention
@@ -104,80 +117,100 @@ ln -s /path/to/RisaAttention/comfyui-risa-attention \
   /path/to/ComfyUI/custom_nodes/comfyui-risa-attention
 ```
 
-Restart ComfyUI and add the **RISA Attention** node before the sampler.
+Restart ComfyUI and add **RISA Attention** before the sampler.
 
-| Mode | Behavior |
+| Node mode | Behavior |
 | --- | --- |
-| `pytorch_attention` | ComfyUI PyTorch attention |
+| `pytorch_attention` | ComfyUI's PyTorch attention backend |
 | `int8_attention` | Dense RISA INT8 attention |
-| `sparse_int8_attention` | Dense pattern construction followed by retained-mass sparse reuse |
+| `sparse_int8_attention` | Dense construction, then sampling-scoped sparse reuse |
 
-The node scopes sparse patterns by sampling run, conditioning branch and
-attention-call ordinal. Masks, cross-attention, compilation and incompatible
-sparse shapes use dense INT8. See [ComfyUI integration](docs/comfyui.md) for
+The node keys patterns by sampling run, conditioning branch and attention-call
+ordinal. Masks, cross-attention, compiled execution and incompatible sparse
+shapes remain on dense INT8. See [ComfyUI integration](docs/comfyui.md) for
 lifecycle details.
 
-## Performance
+## Measured Results
 
-Measured on an NVIDIA GeForce RTX 5090 D v2 with PyTorch 2.13.0, CUDA 13.0,
-BF16, `B=1`, `Hq=16`, `Hkv=4` and `D=128`. Dense values are fused
-end-to-end latency and NRMSE against PyTorch SDPA; each case uses 30 warmups and
-200 timed calls.
+The tables below are controlled attention-kernel measurements, not image or
+video quality results. Reproduction commands, metric definitions, raw JSON
+schema and additional baselines are in [bench/README.md](bench/README.md).
+
+### Dense GQA
+
+NVIDIA GeForce RTX 5090 D v2, PyTorch 2.13.0, CUDA 13.0, BF16,
+`B=1, Hq=16, Hkv=4, D=128`, 30 warmups and 200 CUDA-event samples. Values are
+median end-to-end latency; RISA and comfy-kitchen columns show
+`latency / NRMSE` against PyTorch SDPA for the same BF16 inputs.
 
 | Length | PyTorch SDPA | RISA dense INT8 | comfy-kitchen INT8 | RISA / SDPA |
 | ---: | ---: | ---: | ---: | ---: |
-| 1K | 0.062 ms | 0.075 ms / 0.01422 | 0.070 ms / 0.01517 | 0.83x |
-| 4K | 0.840 ms | 0.351 ms / 0.01532 | 0.348 ms / 0.01637 | 2.39x |
-| 8K | 2.922 ms | 1.231 ms / 0.01580 | 1.210 ms / 0.01693 | 2.37x |
-| 16K | 10.828 ms | 4.351 ms / 0.01565 | 4.351 ms / 0.01684 | 2.49x |
+| 1K | 0.062 ms | 0.074 ms / 0.0142 | 0.070 ms / 0.0152 | 0.83x |
+| 2K | 0.219 ms | 0.133 ms / 0.0148 | 0.129 ms / 0.0158 | 1.65x |
+| 4K | 0.838 ms | 0.352 ms / 0.0153 | 0.349 ms / 0.0164 | 2.38x |
+| 8K | 2.925 ms | 1.229 ms / 0.0158 | 1.169 ms / 0.0169 | 2.38x |
+| 16K | 10.838 ms | 4.358 ms / 0.0157 | 4.357 ms / 0.0168 | 2.49x |
+| 32K | 41.545 ms | 16.893 ms / 0.0156 | 16.896 ms / 0.0168 | 2.46x |
 
-Residual-zero midpoint V removes the long-sequence regression of the original
-midpoint implementation. Against comfy-kitchen's absmax V, output RMSE is
-5.98%-6.96% lower on zero-centered normal inputs from 2K to 16K, with larger
-improvements on shifted and nonnegative V. See the
-[V quantization benchmark](bench/MIDPOINT_V_BENCHMARK.md).
+### Sparse Reuse
 
-Sparse measurements use structured `video_blocks` inputs, `theta=0.99` and
-drift `0.05`. Construction cost is reported separately.
+The following uses the same GQA shape with `video_blocks`, `theta=0.99` and
+Q/K drift `0.05`. Construction produces a dense output and a sparse pattern;
+its cost is deliberately separate from steady-state sparse calls.
 
 | Length | Construction | Dense INT8 | Sparse INT8 | Coverage | Dense / sparse |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1K | 0.161 ms | 0.074 ms | 0.075 ms | 56.9% | 0.99x |
-| 4K | 0.454 ms | 0.350 ms | 0.212 ms | 52.8% | 1.65x |
-| 8K | 1.389 ms | 1.209 ms | 0.622 ms | 50.0% | 1.94x |
-| 16K | 4.877 ms | 4.342 ms | 2.495 ms | 54.6% | 1.74x |
+| 1K | 0.134 ms | 0.074 ms | 0.075 ms | 56.9% | 0.99x |
+| 2K | 0.192 ms | 0.134 ms | 0.099 ms | 50.0% | 1.35x |
+| 4K | 0.451 ms | 0.351 ms | 0.213 ms | 52.8% | 1.65x |
+| 8K | 1.401 ms | 1.229 ms | 0.622 ms | 50.0% | 1.98x |
+| 16K | 4.892 ms | 4.356 ms | 2.506 ms | 54.6% | 1.74x |
+| 32K | 18.762 ms | 16.898 ms | 8.664 ms | 50.6% | 1.95x |
 
-Sparse construction must be amortized across later calls. At 1K, dense
-attention is the practical choice. At 4K, 8K, and 16K, one compatible sparse
-reuse after construction is sufficient to repay the construction overhead in
-this attention-only benchmark.
+For this synthetic workload, construction repays after two compatible reuses
+at 2K and after one reuse from 4K through 32K. At 1K, dense attention is the
+practical choice.
 
-The parallel CUDA selector lowers complete construction median by 1.7%-43.3%
-and p90 by 1.7%-43.3% versus the previous PyTorch selector without changing
-CSR support or output metrics. See the
-[retained-mass selector benchmark](bench/RETAINED_MASS_SELECTOR_BENCHMARK.md).
+### Attention Kernel Scaling
 
-### Sol-Attn comparison
+The kernel scaling comparison uses non-causal BF16 MHA
+(`B=1, Hq=Hkv=16, D=128`) because the current SageAttention3 Blackwell API has
+no GQA/MQA kernel. It uses `video_blocks`, `theta=0.99`, drift `0.05`, seeds
+0-2, 30 warmups and 200 timed calls; SQNR is measured against FP32 PyTorch
+SDPA. SageAttention calls include a K clone because their public APIs modify K
+during smoothing. The full protocol is in [bench/README.md](bench/README.md).
 
-The latest comparison uses comfy-kitchen commit `dae00a13`, which adds its
-INT8 Sol-Attn path. Sol-Attn requires equal Q/K/V head counts, so this test uses
-BF16 `B=1,Hq=Hkv=4,D=128` rather than the GQA configuration above. Inputs use
-the same two-cluster `video_blocks` structure, and RISA uses `theta=0.99` with
-drift `0.05`.
+![RISA, SageAttention2, and SageAttention3 accuracy and speed](bench/risa_sage2_sage3_1k_32k.png)
 
-| Length | PyTorch SDPA | Sol-Attn `tau=1` | RISA dense | RISA sparse | Sol / RISA sparse |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1K | 0.0310 ms | 0.0905 ms | 0.0753 ms | 0.0778 ms | 1.16x |
-| 4K | 0.2055 ms | 0.1386 ms | 0.1361 ms | 0.1001 ms | 1.39x |
-| 8K | 0.8356 ms | 0.3045 ms | 0.3684 ms | 0.2299 ms | 1.32x |
-| 16K | 3.3364 ms | 0.7704 ms | 1.3458 ms | 0.6731 ms | 1.14x |
+![RISA, SageAttention2, and SageAttention3 temporary CUDA allocation](bench/risa_sage2_sage3_memory_1k_32k.png)
 
-These are steady-state medians after the RISA pattern exists. Once pattern
-construction is included, Sol-Attn is faster for 1K and 16K in the measured
-8-call schedule; RISA is faster at 4K and 8K. Three-seed NRMSE is slightly
-higher for RISA sparse at 1K and lower from 4K through 16K. The full protocol,
-p90 latency, memory, numerical ranges and 8/20-call totals are in the
-[Sol-Attn comparison](bench/SOL_ATTN_BENCHMARK.md).
+At 32K, RISA sparse measured `9.149 ms`, `29.13 +/- 2.34 dB` SQNR and
+`320.6 MiB` peak incremental allocation. Under this MHA protocol,
+SageAttention2 measured `17.760 ms`, `27.99 +/- 0.03 dB` and `576.1 MiB`;
+SageAttention3 measured `13.321 ms`, `14.14 +/- 0.01 dB` and `1025.0 MiB`.
+These measurements do not predict end-to-end generation quality.
+
+For the V quantization ablation, see
+[MIDPOINT_V_BENCHMARK.md](bench/MIDPOINT_V_BENCHMARK.md).
+
+### Minimax H3 End-to-End Sampling
+
+The following single-run Minimax H3 text-to-video snapshot uses a 1024 x 1024
+prompt and produces a 5 s video. It measures full sampling time rather than an
+isolated attention call; the values therefore include the rest of the model and
+runtime. RISA sparse at `theta=0.95` completed in `01:36` (`4.84 s/it`), a
+`2.59x` reduction in per-iteration time from PyTorch attention's `12.55 s/it`.
+
+| Attention backend | End-to-end sampling time | Time per iteration |
+| --- | ---: | ---: |
+| PyTorch attention | 04:10 | 12.55 s/it |
+| comfy-kitchen INT8 | 02:10 | 6.49 s/it |
+| SageAttention2 | 02:09 | 6.48 s/it |
+| RISA dense INT8 | 02:09 | 6.47 s/it |
+| RISA sparse, `theta=0.99` | 01:52 | 5.64 s/it |
+| RISA sparse, `theta=0.95` | 01:36 | 4.84 s/it |
+
+![Minimax H3 text-to-video end-to-end sampling time](bench/minimax_h3_t2v_1024_5s.png)
 
 ## API
 
@@ -186,23 +219,23 @@ p90 latency, memory, numerical ranges and 8/20-call totals are in the
 | `int8_attention` | Fused dense INT8 attention |
 | `prequantize_int8_attention` | Pack Q/K/V without executing attention |
 | `int8_attention_from_prequantized` | Execute dense attention from packed tensors |
-| `construct_sparse_int8_attention` | Return dense output and a retained-mass pattern |
-| `sparse_int8_attention` | Execute attention over a frozen sparse pattern |
+| `construct_sparse_int8_attention` | Return a dense output and retained-mass pattern |
+| `sparse_int8_attention` | Execute attention with a frozen sparse pattern |
 | `build_retained_mass_pattern` | FP32 reference pattern builder |
-| `measure_pattern_recall` | Measure exact retained mass after input drift |
+| `measure_pattern_recall` | Measure retained mass on supplied Q/K tensors |
 
-Supported entry points are exported from `risa_attention`; the
-`risa_attention._C` extension is private.
+Public entry points are exported from `risa_attention`; `risa_attention._C` is
+private.
 
-## Benchmarks and Tests
+## Tests and Benchmarks
 
-Run the CUDA and adapter tests:
+Run the test suite:
 
 ```bash
 python -m pytest -q -p no:cacheprovider
 ```
 
-Benchmark commands and metrics are documented in
+Benchmark usage and measurement conventions are documented in
 [bench/README.md](bench/README.md).
 
 ```bash
@@ -232,7 +265,6 @@ RisaAttention/
 - [ComfyUI integration](docs/comfyui.md)
 - [Benchmark guide](bench/README.md)
 - [Retained-mass selector benchmark](bench/RETAINED_MASS_SELECTOR_BENCHMARK.md)
-- [RISA and Sol-Attn benchmark](bench/SOL_ATTN_BENCHMARK.md)
 - [Contributing](CONTRIBUTING.md)
 
 ## License and Attribution

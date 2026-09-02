@@ -56,6 +56,7 @@ class Case:
 @dataclass(frozen=True)
 class ErrorMetrics:
     nrmse_vs_sdpa: float
+    relative_l1_vs_sdpa: float
     mae_vs_sdpa: float
     max_abs_vs_sdpa: float
     cosine_vs_sdpa: float
@@ -73,6 +74,7 @@ class MemoryMetrics:
 
 @dataclass
 class Result:
+    seed: int
     case: str
     pattern: str
     implementation: str
@@ -89,6 +91,7 @@ class Result:
     dense_equivalent_tflops: float | None
     executed_tflops: float | None
     nrmse_vs_sdpa: float | None
+    relative_l1_vs_sdpa: float | None
     mae_vs_sdpa: float | None
     max_abs_vs_sdpa: float | None
     cosine_vs_sdpa: float | None
@@ -103,9 +106,12 @@ class Result:
 
 
 DEFAULT_CASES = (
+    Case(1, 16, 4, 1024, 1024, 128),
+    Case(1, 16, 4, 2048, 2048, 128),
     Case(1, 16, 4, 4096, 4096, 128),
     Case(1, 16, 4, 8192, 8192, 128),
     Case(1, 16, 4, 16384, 16384, 128),
+    Case(1, 16, 4, 32768, 32768, 128),
 )
 
 
@@ -171,6 +177,7 @@ def _errors(
     noise = difference.square().mean().sqrt()
     signal = reference_f.square().mean().sqrt().clamp_min(1e-12)
     nrmse = noise / signal
+    relative_l1 = difference.abs().mean() / reference_f.abs().mean().clamp_min(1e-12)
     cosine = torch.nn.functional.cosine_similarity(
         actual_f.flatten(), reference_f.flatten(), dim=0
     )
@@ -183,6 +190,7 @@ def _errors(
         )
     return ErrorMetrics(
         nrmse_vs_sdpa=float(nrmse),
+        relative_l1_vs_sdpa=float(relative_l1),
         mae_vs_sdpa=float(difference.abs().mean()),
         max_abs_vs_sdpa=float(difference.abs().max()),
         cosine_vs_sdpa=float(cosine),
@@ -272,6 +280,7 @@ def _normal(
 
 
 def _make_result(
+    seed: int,
     case: Case,
     pattern_name: str,
     name: str,
@@ -293,6 +302,7 @@ def _make_result(
     executed_operations = dense_operations * (coverage if coverage is not None else 1.0)
     seconds = median_ms / 1000.0
     return Result(
+        seed=seed,
         case=case.label,
         pattern=pattern_name,
         implementation=name,
@@ -315,6 +325,7 @@ def _make_result(
         ),
         executed_tflops=(executed_operations / seconds / 1e12 if is_compute else None),
         nrmse_vs_sdpa=(errors.nrmse_vs_sdpa if errors else None),
+        relative_l1_vs_sdpa=(errors.relative_l1_vs_sdpa if errors else None),
         mae_vs_sdpa=(errors.mae_vs_sdpa if errors else None),
         max_abs_vs_sdpa=(errors.max_abs_vs_sdpa if errors else None),
         cosine_vs_sdpa=(errors.cosine_vs_sdpa if errors else None),
@@ -334,6 +345,7 @@ def _make_result(
 
 
 def _run_case(
+    seed: int,
     case: Case,
     pattern_name: str,
     dtype: torch.dtype,
@@ -345,6 +357,8 @@ def _run_case(
     warmup: int,
     iterations: int,
     compare_comfy_kitchen: bool,
+    compare_sageattention2: bool,
+    compare_sageattention3: bool,
 ) -> list[Result]:
     if pattern_name == "video_blocks":
         q0, k0, q, k, v = _video_blocks(case, dtype, clusters, prototype_norm, drift)
@@ -400,7 +414,11 @@ def _run_case(
     )
     quantize = lambda: risa.prequantize_int8_attention(q, k, v)
 
-    reference = sdpa()
+    # FP32 SDPA is evaluated once per case and excluded from all timing loops.
+    # It isolates approximation error from the BF16 reference rounding itself.
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float(), baseline_k.float(), baseline_v.float()
+    )
     dense_output = dense_fused()
     sparse_output = sparse_fused()
     implementations = [
@@ -471,9 +489,59 @@ def _run_case(
                 None,
             ),
         )
+    if compare_sageattention2:
+        try:
+            from sageattention import sageattn
+        except ImportError as error:
+            raise RuntimeError(
+                "--compare-sageattention2 requires the sageattention package"
+            ) from error
+
+        def sageattention2() -> torch.Tensor:
+            return sageattn(q, k.clone(), v, tensor_layout="HND")
+
+        sage_output = sageattention2()
+        implementations.insert(
+            2,
+            (
+                "sageattention2_official",
+                sageattention2,
+                _errors(sage_output, reference),
+                None,
+            ),
+        )
+    if compare_sageattention3:
+        if case.q_heads != case.kv_heads:
+            raise RuntimeError(
+                "--compare-sageattention3 requires Hq=Hkv; SageAttention3 has "
+                "no GQA/MQA kernel"
+            )
+        try:
+            from sageattn3 import sageattn3_blackwell
+        except ImportError as error:
+            raise RuntimeError(
+                "--compare-sageattention3 requires the sageattn3 package"
+            ) from error
+
+        def sageattention3() -> torch.Tensor:
+            # The current official API modifies K in place. Clone to make each
+            # timing sample operate on the same inputs and preserve caller data.
+            return sageattn3_blackwell(q, k.clone(), v, is_causal=False)
+
+        sage_output = sageattention3()
+        implementations.insert(
+            2,
+            (
+                "sageattention3_official",
+                sageattention3,
+                _errors(sage_output, reference),
+                None,
+            ),
+        )
 
     results = [
         _make_result(
+            seed,
             case,
             pattern_name,
             "retained_mass_pattern_build",
@@ -499,6 +567,7 @@ def _run_case(
         is_sparse = name.startswith("risa_sparse_")
         results.append(
             _make_result(
+                seed,
                 case,
                 pattern_name,
                 name,
@@ -562,8 +631,10 @@ def main() -> None:
     parser.add_argument("--construction-iterations", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", action="append", type=int)
     parser.add_argument("--compare-comfy-kitchen", action="store_true")
+    parser.add_argument("--compare-sageattention2", action="store_true")
+    parser.add_argument("--compare-sageattention3", action="store_true")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     if not 0.0 < args.theta <= 1.0:
@@ -577,24 +648,29 @@ def main() -> None:
 
     patterns = args.pattern or ["video_blocks"]
     results = []
-    for case in args.case or DEFAULT_CASES:
-        for pattern_name in patterns:
-            torch.manual_seed(args.seed)
-            results.extend(
-                _run_case(
-                    case,
-                    pattern_name,
-                    args.dtype,
-                    args.theta,
-                    args.drift,
-                    args.clusters,
-                    args.prototype_norm,
-                    args.construction_iterations,
-                    args.warmup,
-                    args.iterations,
-                    args.compare_comfy_kitchen,
+    seeds = args.seed or [0]
+    for seed in seeds:
+        for case in args.case or DEFAULT_CASES:
+            for pattern_name in patterns:
+                torch.manual_seed(seed)
+                results.extend(
+                    _run_case(
+                        seed,
+                        case,
+                        pattern_name,
+                        args.dtype,
+                        args.theta,
+                        args.drift,
+                        args.clusters,
+                        args.prototype_norm,
+                        args.construction_iterations,
+                        args.warmup,
+                        args.iterations,
+                        args.compare_comfy_kitchen,
+                        args.compare_sageattention2,
+                        args.compare_sageattention3,
+                    )
                 )
-            )
     _print_table(results)
     if args.json:
         payload = {
@@ -610,8 +686,11 @@ def main() -> None:
             "construction_iterations": args.construction_iterations,
             "warmup": args.warmup,
             "iterations": args.iterations,
-            "seed": args.seed,
+            "seeds": seeds,
             "compare_comfy_kitchen": args.compare_comfy_kitchen,
+            "reference": "float32 PyTorch SDPA",
+            "compare_sageattention2": args.compare_sageattention2,
+            "compare_sageattention3": args.compare_sageattention3,
             "patterns": patterns,
             "results": [asdict(result) for result in results],
         }
