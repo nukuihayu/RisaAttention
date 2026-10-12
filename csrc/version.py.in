@@ -1,0 +1,2 @@
+# Generated from the same metadata used for the wheel filename.
+__version__ = "@SKBUILD_PROJECT_VERSION_FULL@"

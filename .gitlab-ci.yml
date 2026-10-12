@@ -1,0 +1,72 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api"'
+    - when: never
+
+stages: [build, publish]
+
+variables:
+  RISA_CUDA_ARCHITECTURES:
+    value: "80-real;86-real;89-real;90-real;100-real;120-real"
+    description: "Explicit native cubins; no GPU detection or nvcc architecture discovery. Minimum SM80."
+  PUBLISH:
+    value: "false"
+    options: ["false", "true"]
+    description: "false: build artifacts only; true: publish PyPI wheels and create/update the versioned Release."
+  BUILD_TARGET:
+    value: "all"
+    options: ["all", "cu130-py312", "cu130-py313"]
+    description: "Build all RISA wheels, or one CUDA/Python target for backfill."
+  PUBLISH_ONLY:
+    value: "false"
+    options: ["false", "true"]
+    description: "true: skip compilation and publish artifacts from PUBLISH_ARTIFACT_JOBS."
+  RELEASE_COMMIT_SHA:
+    value: ""
+    description: "Full source SHA recorded by reused build artifacts (required for publish-only)."
+  PUBLISH_ARTIFACT_JOBS:
+    value: ""
+    description: "Comma-separated successful build job IDs to reuse (required for publish-only)."
+  MAX_JOBS: "1"
+  CMAKE_BUILD_PARALLEL_LEVEL: "1"
+  UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"
+
+build:wheels:
+  stage: build
+  rules:
+    - if: '$PUBLISH_ONLY == "true"'
+      when: never
+    - when: on_success
+  image: $CUDA_IMAGE
+  timeout: 4h
+  resource_group: risa-native-build
+  parallel:
+    matrix:
+      - CUDA_IMAGE: "nvidia/cuda:13.0.0-devel-ubuntu24.04"
+        CUDA_TAG: "cu130"
+        PYTHON_VERSION: ["3.12", "3.13"]
+  # Partial success is intentional; publication requires at least one valid wheel.
+  allow_failure: true
+  script:
+    - bash ci/build-wheel.sh
+  artifacts:
+    when: always
+    name: "risa-${CUDA_TAG}-py${PYTHON_VERSION}-${CI_COMMIT_SHORT_SHA}"
+    paths: [.gitlab-results/]
+    expire_in: 14 days
+
+publish:release:
+  stage: publish
+  image: python:3.12-slim
+  resource_group: risa-release
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends git
+    - rm -rf /var/lib/apt/lists/*
+  script:
+    - pip install --disable-pip-version-check packaging==26.3 PyYAML==6.0.3 twine==6.2.0
+    - python ci/wheels.py publish
+  artifacts:
+    when: always
+    paths: [.gitlab-results/release-notes.md, .gitlab-results/SHA256SUMS]
+    expire_in: 14 days

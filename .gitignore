@@ -1,0 +1,15 @@
+build/
+dist/
+*.egg-info/
+*.whl
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+benchmarks/results/
+
+.gitlab-results/
+.gitlab-venv/
+.uv-cache/
+benchmarks/data/

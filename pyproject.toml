@@ -1,0 +1,50 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4", "cmake>=3.26", "ninja"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "risa-attention"
+dynamic = ["version"]
+description = "Rotation-stabilized INT8 dense and retained-mass sparse attention"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = ["torch>=2.4"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["attention", "cuda", "diffusion", "int8", "pytorch"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+[tool.scikit-build]
+minimum-version = "0.10"
+experimental = true
+cmake.source-dir = "csrc"
+cmake.build-type = "Release"
+wheel.packages = ["src/risa_attention"]
+sdist.exclude = [".pytest_cache", ".ruff_cache", "**/__pycache__", "**/*.pyc", "dist"]
+# Use scikit-build-core's per-invocation temporary build directory.
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "VERSION"
+regex = '^(?P<value>\S+)\s*$'
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --import-mode=importlib --confcutdir=tests"
+markers = ["cuda: requires the built CUDA extension and a compatible GPU"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]

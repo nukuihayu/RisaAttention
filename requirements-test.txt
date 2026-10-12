@@ -1,0 +1,10 @@
+# Install PyTorch separately; CUDA tests also need the compiled RISA wheel.
+pytest>=8
+setuptools>=68
+tomli>=2; python_version < "3.11"
+ruff
+packaging>=24
+PyYAML>=6
+build>=1
+scikit-build-core>=0.10
+clang-format>=18

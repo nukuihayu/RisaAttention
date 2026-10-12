@@ -1,0 +1,9 @@
+setuptools==84.0.0
+wheel==0.48.0
+build==1.6.1
+packaging==26.3
+PyYAML==6.0.3
+cmake==3.31.10
+ninja==1.13.0
+nanobind==3.1.0
+scikit-build-core==1.0.3
